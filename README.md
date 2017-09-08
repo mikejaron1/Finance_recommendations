@@ -1,4 +1,4 @@
-# Finance_recomendations
+# Finance_recommendations
 ### basically try to build what a Financial Planner would do
 
 Ideas for myself or Mom:
