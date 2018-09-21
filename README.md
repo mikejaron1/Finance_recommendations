@@ -1,7 +1,7 @@
 # Finance_recommendations
 ### basically try to build what a Financial Planner would do
 
-Ideas for myself or Mom:
+Ideas:
 * wealthfront vs Schwab?
 * 401k vs Roth? how much each?
 * house renovations? turf? solar?
