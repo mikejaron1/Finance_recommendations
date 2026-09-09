@@ -38,6 +38,13 @@ class TestSimulateReturns:
         a = MarketAssumptions(seed=123)
         assert np.allclose(simulate_returns(10, 100, a), simulate_returns(10, 100, a))
 
+    @pytest.mark.parametrize("model", ["lognormal", "student_t", "bootstrap"])
+    def test_extending_horizon_preserves_existing_draws(self, model):
+        a = MarketAssumptions(model=model, seed=7)
+        short = simulate_returns(5, 100, a)
+        long = simulate_returns(30, 100, a)
+        assert np.array_equal(short, long[:, :5])
+
     def test_different_seeds_differ(self):
         a = simulate_returns(10, 100, MarketAssumptions(seed=1))
         b = simulate_returns(10, 100, MarketAssumptions(seed=2))

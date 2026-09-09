@@ -27,18 +27,23 @@ import numpy as np
 import pandas as pd
 
 from . import taxes as tax_mod
-from .montecarlo import MarketAssumptions, simulate_drawdown, simulate_wealth
+from .montecarlo import MarketAssumptions, simulate_returns
 
 __all__ = ["RetirementInputs", "roth_vs_traditional", "drawdown_plan", "contribution_priority"]
 
-# Uniform Lifetime Table divisors (SECURE 2.0 start age 73).
-RMD_DIVISORS = {
-    73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1,
-    80: 20.2, 81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2,
-    87: 14.4, 88: 13.7, 89: 12.9, 90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1,
-    94: 9.5, 95: 8.9, 96: 8.4, 97: 7.8, 98: 7.3, 99: 6.8, 100: 6.4,
-}
+# Retain the public table name, sourcing current statutory divisors centrally.
+RMD_DIVISORS = {70: 29.1, 71: 28.2, **tax_mod.RMD_UNIFORM_LIFETIME}
 RMD_START_AGE = 73
+
+
+def rmd_start_age(birth_year: int, birth_month: int | None = None) -> float:
+    """Shared statutory cohort rule with a disclosed conservative 1949 default.
+
+    Existing callers only supplied a year. For 1949 without a month, January
+    selects the earlier start; the drawdown result discloses this assumption.
+    """
+    month = 1 if birth_year == 1949 and birth_month is None else birth_month
+    return tax_mod.rmd_start_age(birth_year, month)
 
 
 @dataclass
@@ -52,11 +57,24 @@ class RetirementInputs:
     filing_status: str = "married_joint"
     state: str = "CA"
     retirement_state: str | None = None
-    tax_year: int = 2025
+    tax_year: int = tax_mod.DEFAULT_YEAR
+
+    # What the marginal rate should actually be worked out on. A year in which
+    # a business made a loss, or a big deduction lands, can put you several
+    # brackets below where your salary suggests — and that is precisely when a
+    # Roth contribution beats a deduction, so the page has to see it.
+    self_employment_income: float = 0.0     # negative for a loss
+    itemized_deductions: float = 0.0
+    above_the_line_deductions: float = 0.0
+    w2_wages: float | None = None           # None = all of gross_income
 
     annual_contribution: float = 23_500
     employer_match_pct: float = 0.05
     employer_match_limit_pct: float = 0.05
+    # Your own pay, not the household's: a partner's employer matches into a
+    # partner's plan. ``None`` falls back to gross_income for old callers.
+    match_eligible_pay: float | None = None
+    employer_match_dollar_cap: float | None = None
     existing_traditional_balance: float = 0.0
     existing_roth_balance: float = 0.0
     existing_taxable_balance: float = 0.0
@@ -71,6 +89,9 @@ class RetirementInputs:
     taxable_gains_rate: float = 0.15
 
     comparison_basis: str = "equal_gross_cost"  # or "equal_contribution"
+    birth_year: int | None = None  # Defaults to tax_year - current_age.
+    birth_month: int | None = None
+    spending_in_current_dollars: bool = False
 
 
 def _state_rate(state: str | None) -> float:
@@ -89,20 +110,42 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
     if years <= 0:
         raise ValueError("retirement_age must exceed current_age")
 
-    work_state_rate = _state_rate(i.state)
-    retire_state_rate = _state_rate(i.retirement_state if i.retirement_state is not None else i.state)
+    work_state_name = i.state
+    retire_state_name = i.retirement_state if i.retirement_state is not None else i.state
+    work_state_rate = _state_rate(work_state_name)
+    retire_state_rate = _state_rate(retire_state_name)
 
     # Marginal rate today, used to convert pre-tax dollars to after-tax dollars.
+    # Worked out on real taxable income, not gross pay: business losses and
+    # deductions can move this by ten points or more, and the whole Roth-vs-
+    # Traditional question is "what rate are you giving up a deduction at".
+    wage_income = i.gross_income - i.self_employment_income
     current = tax_mod.compute_tax(
-        i.gross_income, i.filing_status, i.tax_year, state_rate=work_state_rate, include_payroll=False
+        i.gross_income, i.filing_status, i.tax_year, state=work_state_name,
+        include_payroll=False, itemized=i.itemized_deductions,
+        above_the_line=i.above_the_line_deductions,
+        self_employment_income=i.self_employment_income,
+        wages_share=(i.w2_wages / wage_income) if (i.w2_wages is not None and wage_income > 0) else 1.0,
     )
-    current_marginal = current.marginal_rate + work_state_rate
+    # ``marginal_rate`` already includes state. Adding the state rate again put
+    # a California household on 38.6% when the true combined figure was 21.3%,
+    # which is enough to flip the recommendation on its own. Using the state's
+    # *top* rate was the second half of the same error: a low-income year pays
+    # California's low brackets, not 13.3%.
+    current_marginal = current.marginal_rate
 
     limit = tax_mod.contribution_limit("401k", i.current_age, i.tax_year)
-    contribution = min(i.annual_contribution, limit)
+    eligible_pay = i.match_eligible_pay if i.match_eligible_pay is not None else i.gross_income
+    contribution = max(0.0, min(i.annual_contribution, limit, eligible_pay))
     over_limit = max(0.0, i.annual_contribution - limit)
 
-    employer_match = min(i.employer_match_pct, i.employer_match_limit_pct) * i.gross_income
+    match_detail = tax_mod.employer_match(
+        i.match_eligible_pay if i.match_eligible_pay is not None else i.gross_income,
+        i.employer_match_pct, i.employer_match_limit_pct,
+        your_contribution=contribution, dollar_cap=i.employer_match_dollar_cap,
+        age=i.current_age, year=i.tax_year,
+    )
+    employer_match = match_detail["earned_amount"]
     # Employer match is always pre-tax, even alongside a Roth deferral.
 
     if i.comparison_basis == "equal_gross_cost":
@@ -114,6 +157,12 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
         roth_contribution = contribution
         # Traditional frees up this much cash, invested in a taxable account.
         trad_side_account = contribution * current_marginal
+    roth_match_detail = tax_mod.employer_match(
+        eligible_pay, i.employer_match_pct, i.employer_match_limit_pct,
+        your_contribution=roth_contribution, dollar_cap=i.employer_match_dollar_cap,
+        age=i.current_age, year=i.tax_year,
+    )
+    roth_employer_match = roth_match_detail["earned_amount"]
 
     net_return = i.expected_return - i.investment_fee
 
@@ -125,15 +174,16 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
     existing_roth_path = _grow(i.existing_roth_balance, 0.0, net_return, years, i.income_growth)
 
     # Roth savers still get the employer match, but it always lands pre-tax.
-    match_path = _grow(0.0, employer_match, net_return, years, i.income_growth)
-    trad_contrib_path = _grow(0.0, trad_contribution + employer_match, net_return, years, i.income_growth)
-    roth_contrib_path = _grow(0.0, roth_contribution, net_return, years, i.income_growth)
+    match_path = _grow(0.0, roth_employer_match, net_return, years, 0.0)
+    trad_match_path = _grow(0.0, employer_match, net_return, years, 0.0)
+    trad_contrib_path = _grow(0.0, trad_contribution, net_return, years, 0.0) + trad_match_path
+    roth_contrib_path = _grow(0.0, roth_contribution, net_return, years, 0.0)
 
     trad_path = existing_trad_path + trad_contrib_path
     roth_path = existing_roth_path + roth_contrib_path
     roth_trad_side = existing_trad_path + match_path
 
-    side_path, side_basis = _grow_taxable(0.0, trad_side_account, net_return, years, i.income_growth, i.taxable_gains_rate)
+    side_path, side_basis = _grow_taxable(0.0, trad_side_account, net_return, years, 0.0, i.taxable_gains_rate)
 
     trad_balance = trad_path[-1]
     roth_balance = roth_path[-1]
@@ -145,18 +195,28 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
     # balances at an effective (not marginal) rate via a realistic drawdown.
     # Each side carries the same pre-existing Roth balance, so it nets out of
     # the comparison but keeps the reported totals honest.
+    #
+    # The taxable side account belongs to *Traditional*: it exists only because
+    # the pre-tax deduction freed up cash that the Roth saver had to hand over
+    # in tax. Crediting it to Roth double-counts the deduction and inflated the
+    # Roth result by the whole side account.
     horizon = i.life_expectancy - i.retirement_age
     existing_roth_balance = existing_roth_path[-1]
-    trad_spendable = _after_tax_value(trad_balance, i, horizon, retire_state_rate) + existing_roth_balance
-    roth_spendable = roth_balance + _after_tax_value(roth_match_balance, i, horizon, retire_state_rate) + side_after_tax
+    trad_spendable = (_after_tax_value(trad_balance, i, horizon, retire_state_rate)
+                      + side_after_tax + existing_roth_balance)
+    roth_spendable = roth_balance + _after_tax_value(roth_match_balance, i, horizon, retire_state_rate)
 
     breakeven_rate = _breakeven_tax_rate(
-        trad_balance, roth_balance + side_after_tax - existing_roth_balance, roth_match_balance, i, retire_state_rate
+        trad_balance, roth_balance - existing_roth_balance - side_after_tax,
+        roth_match_balance, i, retire_state_rate
     )
 
     projected_retirement_marginal = tax_mod.compute_tax(
-        i.desired_retirement_spending, i.filing_status, i.tax_year, state_rate=retire_state_rate, include_payroll=False
-    ).marginal_rate + retire_state_rate
+        i.desired_retirement_spending * (
+            (1 + i.inflation) ** years if i.spending_in_current_dollars else 1.0
+        ), i.filing_status, i.tax_year, state=retire_state_name,
+        include_payroll=False,
+    ).marginal_rate
 
     winner = "roth" if roth_spendable > trad_spendable else "traditional"
     delta = abs(roth_spendable - trad_spendable)
@@ -167,6 +227,13 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
             "traditional": trad_path,
             "roth": roth_path,
             "roth_side_match": roth_trad_side,
+            # The pre-tax pot beside a Roth is two different things, and
+            # lumping them together made a page report a $250k existing 401k
+            # as "employer contributions" — 65% of the pot, when the employer
+            # could only ever put in $11k a year. They are split out here so
+            # nothing downstream can conflate them again.
+            "existing_pretax": existing_trad_path,
+            "employer_match": match_path,
             "traditional_side_taxable": side_path,
         }
     )
@@ -177,10 +244,15 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
         "contribution_limit": limit,
         "over_limit_amount": over_limit,
         "employer_match_annual": employer_match,
+        "roth_employer_match_annual": roth_employer_match,
+        "employer_match_detail": match_detail,
+        "current_taxable_income": current.taxable_income,
         "current_marginal_rate": current_marginal,
         "traditional_balance": trad_balance,
         "roth_balance": roth_balance,
         "roth_employer_match_balance": roth_match_balance,
+        "roth_match_only_balance": float(match_path[-1]),
+        "existing_pretax_balance": float(existing_trad_path[-1]),
         "traditional_side_account_after_tax": side_after_tax,
         "traditional_spendable": trad_spendable,
         "roth_spendable": roth_spendable,
@@ -189,6 +261,12 @@ def roth_vs_traditional(inputs: RetirementInputs) -> dict:
         "breakeven_future_tax_rate": breakeven_rate,
         "projected_retirement_marginal_rate": projected_retirement_marginal,
         "comparison_basis": i.comparison_basis,
+        "assumptions": [
+            "Projected balances are retirement-year nominal dollars.",
+            "Employee and earned employer contributions held nominally fixed at selected-year limits; future increases not assumed.",
+            "Traditional spendable value approximates even withdrawals over retirement, not a liquidation tax.",
+            "State tax is a planning estimate; qualified Roth distributions assumed tax-free.",
+        ],
         "recommendation": _roth_recommendation(
             winner, delta, breakeven_rate, projected_retirement_marginal, current_marginal, over_limit, employer_match
         ),
@@ -224,8 +302,9 @@ def _grow_taxable(
     basis = initial
     contribution = annual_contribution
     for t in range(1, years + 1):
+        reinvested_dividends = max(0.0, balance * dividend_yield * (1 - tax_rate))
         balance = balance * (1 + effective_rate) + contribution
-        basis += contribution
+        basis += contribution + reinvested_dividends
         contribution *= 1 + contribution_growth
         path[t] = balance
     return path, basis
@@ -242,11 +321,17 @@ def _after_tax_value(pretax_balance: float, i: RetirementInputs, horizon_years: 
     if pretax_balance <= 0 or horizon_years <= 0:
         return max(0.0, pretax_balance)
     annual_withdrawal = pretax_balance / horizon_years
-    taxable = annual_withdrawal + i.other_retirement_income
-    result = tax_mod.compute_tax(
-        taxable, i.filing_status, i.tax_year, state_rate=state_rate, include_payroll=False
+    other_income = i.other_retirement_income * (
+        (1 + i.inflation) ** max(0, i.retirement_age - i.current_age)
+        if i.spending_in_current_dollars else 1.0
     )
-    effective = result.total_tax / taxable if taxable > 0 else 0.0
+    taxable = annual_withdrawal + other_income
+    state = i.retirement_state if i.retirement_state is not None else i.state
+    result = tax_mod.compute_tax(taxable, i.filing_status, i.tax_year,
+                                state=state, include_payroll=False)
+    baseline = tax_mod.compute_tax(other_income, i.filing_status, i.tax_year,
+                                  state=state, include_payroll=False)
+    effective = (result.total_tax - baseline.total_tax) / annual_withdrawal
     return pretax_balance * (1 - effective)
 
 
@@ -297,82 +382,48 @@ def drawdown_plan(
     roth_balance: float,
     taxable_balance: float = 0.0,
     n_sims: int = 3_000,
+    *,
+    taxable_basis: float | None = None,
 ) -> dict:
     """Simulate retirement spending across account types, tax-aware.
 
-    Withdrawal ordering is taxable → traditional → Roth, which is generally
-    optimal: it lets tax-advantaged accounts compound longest and leaves the
-    tax-free bucket for late-life or heirs. RMDs are forced from the
-    Traditional balance starting at age 73 regardless of need.
+    Both deterministic and stochastic paths use the same annual withdrawal
+    engine. RMDs precede taxable → Traditional → qualified Roth withdrawals;
+    this is a disclosed policy, not a claim of tax-optimal ordering. Success
+    means every year's after-tax spending was met, even if the last dollar is
+    spent in the final year. Missing taxable basis conservatively means zero.
     """
     i = inputs
     years = i.life_expectancy - i.retirement_age
-    retire_state_rate = _state_rate(i.retirement_state if i.retirement_state is not None else i.state)
-
+    if years <= 0 or n_sims <= 0:
+        raise ValueError("retirement horizon and simulation count must be positive")
+    if min(traditional_balance, roth_balance, taxable_balance,
+           i.desired_retirement_spending, i.other_retirement_income) < 0:
+        raise ValueError("balances, spending, and other income must be nonnegative")
+    if not 0 <= i.taxable_gains_rate <= 1 or not 0 <= i.investment_fee < 1:
+        raise ValueError("invalid investment tax rate or fee")
+    if i.expected_return <= -1 or i.inflation <= -1:
+        raise ValueError("return and inflation must exceed -100%")
+    basis = 0.0 if taxable_basis is None else taxable_basis
+    if basis < 0 or not np.isfinite(basis):
+        raise ValueError("taxable basis must be finite and nonnegative")
     total = traditional_balance + roth_balance + taxable_balance
-    spending_need = max(0.0, i.desired_retirement_spending - i.other_retirement_income)
-
-    # Deterministic, tax-aware year-by-year path.
-    trad, roth, taxable = traditional_balance, roth_balance, taxable_balance
-    rows = []
-    depleted_age = None
-    for year in range(years):
-        age = i.retirement_age + year
-        need = spending_need * (1 + i.inflation) ** year
-        rmd = 0.0
-        if age >= RMD_START_AGE and trad > 0:
-            divisor = RMD_DIVISORS.get(min(age, 100), 6.4)
-            rmd = trad / divisor
-
-        from_taxable = min(taxable, need)
-        remaining = need - from_taxable
-        taxable -= from_taxable
-
-        gross_needed = tax_mod.gross_up(remaining, i.filing_status, i.tax_year, retire_state_rate) if remaining > 0 else 0.0
-        from_trad = min(trad, max(gross_needed, rmd))
-        trad -= from_trad
-        tax_paid = tax_mod.compute_tax(
-            from_trad + i.other_retirement_income, i.filing_status, i.tax_year,
-            state_rate=retire_state_rate, include_payroll=False
-        ).total_tax if from_trad > 0 else 0.0
-        net_from_trad = from_trad - tax_paid
-
-        still_short = max(0.0, remaining - net_from_trad)
-        from_roth = min(roth, still_short)
-        roth -= from_roth
-
-        # Excess RMD beyond spending need lands in the taxable account.
-        surplus = max(0.0, net_from_trad - remaining)
-        taxable += surplus
-
-        trad *= 1 + i.expected_return - i.investment_fee
-        roth *= 1 + i.expected_return - i.investment_fee
-        taxable *= 1 + i.expected_return - i.investment_fee - 0.018 * i.taxable_gains_rate
-
-        balance_total = trad + roth + taxable
-        if balance_total <= 0 and depleted_age is None:
-            depleted_age = age
-
-        rows.append({
-            "age": age, "spending_need": need, "rmd": rmd,
-            "from_taxable": from_taxable, "from_traditional": from_trad, "from_roth": from_roth,
-            "tax_paid": tax_paid, "traditional": max(0.0, trad), "roth": max(0.0, roth),
-            "taxable": max(0.0, taxable), "total": max(0.0, balance_total),
-        })
-
-    table = pd.DataFrame(rows)
-
-    # Stochastic view of the same plan.
+    inflation_to_retirement = (1 + i.inflation) ** max(0, i.retirement_age - i.current_age)
+    dollar_factor = inflation_to_retirement if i.spending_in_current_dollars else 1.0
+    spending_need = max(0.0, (i.desired_retirement_spending - i.other_retirement_income) * dollar_factor)
+    ordinary_tax = _ordinary_retirement_tax(i)
+    starting = (traditional_balance, roth_balance, taxable_balance, basis)
+    deterministic = _account_drawdown(i, starting, np.full((1, years), i.expected_return),
+                                      ordinary_tax, dollar_factor)
+    table = deterministic.pop("table")
+    short = table.loc[table["spending_shortfall"] > 1e-6, "age"]
+    depleted_age = int(short.iloc[0]) if len(short) else None
     assumptions = MarketAssumptions(
         mean_return=i.expected_return, volatility=i.volatility, inflation_mean=i.inflation
     )
-    mc = simulate_drawdown(
-        total, spending_need, years, assumptions, n_sims=n_sims, annual_fee=i.investment_fee
-    )
-    mc_guardrails = simulate_drawdown(
-        total, spending_need, years, assumptions, n_sims=n_sims,
-        annual_fee=i.investment_fee, guardrails=True
-    )
+    returns = simulate_returns(years, n_sims, assumptions)
+    mc = _account_drawdown(i, starting, returns, ordinary_tax, dollar_factor)
+    mc_guardrails = _account_drawdown(i, starting, returns, ordinary_tax, dollar_factor, guardrails=True)
 
     withdrawal_rate = spending_need / total if total > 0 else float("inf")
     return {
@@ -387,7 +438,131 @@ def drawdown_plan(
         "monte_carlo_guardrails": mc_guardrails,
         "success_rate": mc["success_rate"],
         "success_rate_with_guardrails": mc_guardrails["success_rate"],
+        "rmd_start_age": rmd_start_age(
+            i.birth_year if i.birth_year is not None else i.tax_year - i.current_age, i.birth_month),
+        "taxable_basis": basis,
+        "assumptions": [
+            "Spending and other income are retirement-year nominal dollars unless spending_in_current_dollars=True.",
+            "Other income treated as fully taxable ordinary income, inflation-indexed; Social Security exclusions not modeled.",
+            "Selected-year tax brackets held nominally fixed; state taxes are planning approximations.",
+            "Taxable gains use caller flat rate, proportional basis; no loss tax credits or annual dividend distributions.",
+            "Missing taxable basis defaults to zero, not tax-free withdrawals; Roth withdrawals assumed qualified.",
+            "RMD uses birth cohort and prior year-end balance; first-year deferral and spouse-specific tables not modeled.",
+            "For the split 1949 cohort, a missing birth month explicitly assumes January (earlier RMD start).",
+            "Legacy 70½ cohorts begin in the calendar year of age 70; early-age divisors are approximations, not historical tax returns.",
+            "Withdrawals precede returns; same account-aware engine and return paths for both spending policies.",
+            "Guardrails cut spending 10% when withdrawal pressure exceeds 120% of its initial level; no upside raises.",
+            "Guardrail success means meeting the reduced budget, not preserving the original standard of living.",
+        ],
         "recommendation": _drawdown_recommendation(mc["success_rate"], mc_guardrails["success_rate"], withdrawal_rate),
+    }
+
+
+def _ordinary_retirement_tax(i: RetirementInputs):
+    """Vectorized exact interpolation of the shared piecewise-linear tax model."""
+    state = i.retirement_state if i.retirement_state is not None else i.state
+    deduction = tax_mod.standard_deduction(i.filing_status, i.tax_year)
+    knots = {0.0, deduction, 1e15}
+    for _rate, threshold in tax_mod.ORDINARY_BRACKETS[i.tax_year][i.filing_status]:
+        if np.isfinite(threshold):
+            knots.add(deduction + threshold)
+    threshold = tax_mod.STATE_TOP_BRACKET_THRESHOLD.get(state.upper())
+    if state.upper() == "MA":
+        threshold = {2024: 1_053_750, 2025: 1_083_150, 2026: 1_107_750}[i.tax_year]
+    if threshold is not None:
+        knots.add(deduction + threshold)
+    x = np.array(sorted(knots))
+    y = np.array([tax_mod.compute_tax(float(v), i.filing_status, i.tax_year,
+                                     state=state, include_payroll=False).total_tax for v in x])
+    return lambda income: np.interp(income, x, y)
+
+
+def _account_drawdown(i, starting, returns, ordinary_tax, dollar_factor, guardrails=False):
+    n_sims, years = returns.shape
+    trad, roth, taxable, basis = [np.full(n_sims, float(v)) for v in starting]
+    paths = np.empty((n_sims, years + 1))
+    paths[:, 0] = trad + roth + taxable
+    spending = np.zeros((n_sims, years))
+    shortfalls = np.zeros_like(spending)
+    taxes = np.zeros_like(spending)
+    depleted = np.full(n_sims, -1)
+    policy_scale = np.ones(n_sims)
+    initial = sum(starting[:3])
+    initial_need = max(0.0, (i.desired_retirement_spending - i.other_retirement_income) * dollar_factor)
+    target_rate = initial_need / initial if initial else 0.0
+    birth_year = i.birth_year if i.birth_year is not None else i.tax_year - i.current_age
+    start_age = rmd_start_age(birth_year, i.birth_month)
+    rows = []
+    for year in range(years):
+        age = i.retirement_age + year
+        price_level = dollar_factor * (1 + i.inflation) ** year
+        other = i.other_retirement_income * price_level
+        if guardrails and year and target_rate > 0:
+            pressure = initial_need * (1 + i.inflation) ** year * policy_scale / np.maximum(trad + roth + taxable, 1)
+            policy_scale = np.where(pressure > target_rate * 1.2, policy_scale * 0.9, policy_scale)
+        goal = i.desired_retirement_spending * price_level * policy_scale
+        rmd = trad / RMD_DIVISORS.get(min(age, 120), 2.0) if age >= int(start_age) else np.zeros(n_sims)
+        from_trad = np.minimum(trad, rmd)
+        baseline_tax = ordinary_tax(other)
+        trad_tax = ordinary_tax(other + from_trad) - baseline_tax
+        need = np.maximum(0.0, goal - other + baseline_tax - from_trad + trad_tax)
+        gain_fraction = np.maximum(0.0, 1 - np.divide(basis, taxable, out=np.zeros(n_sims), where=taxable > 0))
+        net_fraction = 1 - gain_fraction * i.taxable_gains_rate
+        from_taxable = np.minimum(taxable, np.divide(need, net_fraction, out=np.full(n_sims, np.inf), where=net_fraction > 0))
+        gains_tax = from_taxable * gain_fraction * i.taxable_gains_rate
+        basis_removed = np.divide(basis * from_taxable, taxable, out=np.zeros(n_sims), where=taxable > 0)
+        taxable -= from_taxable
+        basis = np.maximum(0.0, basis - basis_removed)
+        remaining = np.maximum(0.0, need - from_taxable + gains_tax)
+        low = np.zeros(n_sims)
+        high = np.where(remaining > 0, np.maximum(0.0, trad - from_trad), 0.0)
+        for _ in range(40):
+            middle = (low + high) / 2
+            net = middle - (ordinary_tax(other + from_trad + middle) - ordinary_tax(other + from_trad))
+            low = np.where(net < remaining, middle, low)
+            high = np.where(net >= remaining, middle, high)
+        from_trad += high
+        from_trad = np.minimum(from_trad, trad)
+        tax_paid = ordinary_tax(other + from_trad) + gains_tax
+        available = other + from_trad + from_taxable - tax_paid
+        from_roth = np.minimum(roth, np.maximum(0.0, goal - available))
+        available += from_roth
+        shortfall = np.maximum(0.0, goal - available)
+        surplus = np.maximum(0.0, available - goal)
+        trad -= from_trad
+        roth -= from_roth
+        taxable += surplus
+        basis += surplus
+        growth = np.maximum(0.0, (1 + returns[:, year]) * (1 - i.investment_fee))
+        trad *= growth
+        roth *= growth
+        taxable *= growth
+        total = trad + roth + taxable
+        paths[:, year + 1] = total
+        spending[:, year] = np.minimum(goal, np.maximum(0.0, available))
+        shortfalls[:, year] = shortfall
+        taxes[:, year] = tax_paid
+        depleted[(shortfall > 1e-6) & (depleted < 0)] = year + 1
+        if n_sims == 1:
+            rows.append({
+                "age": age, "spending_need": max(0.0, float(goal[0]) - other),
+                "rmd": float(rmd[0]), "from_taxable": float(from_taxable[0]),
+                "from_traditional": float(from_trad[0]), "from_roth": float(from_roth[0]),
+                "tax_paid": float(tax_paid[0]), "traditional": float(trad[0]), "roth": float(roth[0]),
+                "taxable": float(taxable[0]), "taxable_basis": float(basis[0]), "total": float(total[0]),
+                "spending_shortfall": float(shortfall[0]), "after_tax_spending": float(spending[0, year]),
+            })
+    return {
+        "table": pd.DataFrame(rows), "paths": paths,
+        "success_rate": float((depleted < 0).mean()),
+        "spending_paths": spending, "shortfall_paths": shortfalls, "tax_paths": taxes,
+        "median_ending_balance": float(np.median(paths[:, -1])),
+        "p10_ending_balance": float(np.percentile(paths[:, -1], 10)),
+        "p90_ending_balance": float(np.percentile(paths[:, -1], 90)),
+        "median_years_lasted": float(np.median(np.where(depleted < 0, years, depleted))),
+        "worst_case_depletion_year": int(depleted[depleted > 0].min()) if (depleted > 0).any() else years,
+        "median_total_spending": float(np.median(spending.sum(axis=1))),
+        "median_annual_spending": float(np.median(spending, axis=0).mean()),
     }
 
 
@@ -401,7 +576,7 @@ def _drawdown_recommendation(success: float, success_guardrails: float, rate: fl
     lift = success_guardrails - success
     guard = (
         f" Adopting flexible spending guardrails (cut ~10% after bad years) lifts that to "
-        f"{success_guardrails:.0%} — a {lift:.0%}-point gain for free."
+        f"{success_guardrails:.0%} — a {lift:.0%}-point gain that requires accepting lower spending."
         if lift > 0.01 else ""
     )
     rate_note = (
@@ -417,12 +592,13 @@ def contribution_priority(
     employer_match_pct: float = 0.05,
     employer_match_limit_pct: float = 0.05,
     has_hdhp: bool = False,
+    hdhp_coverage: str = "self",
     high_interest_debt: float = 0.0,
     high_interest_rate: float = 0.20,
     emergency_fund_gap: float = 0.0,
     age: int = 40,
     filing_status: str = "married_joint",
-    tax_year: int = 2025,
+    tax_year: int = tax_mod.DEFAULT_YEAR,
 ) -> pd.DataFrame:
     """The canonical savings waterfall, applied to a real dollar amount.
 
@@ -439,7 +615,12 @@ def contribution_priority(
         rows.append({"priority": len(rows) + 1, "bucket": name, "annual_amount": amount,
                      "cap": cap, "rationale": rationale})
 
-    match_needed = min(employer_match_pct, employer_match_limit_pct) * gross_income
+    match_detail = tax_mod.employer_match(
+        gross_income, employer_match_pct, employer_match_limit_pct,
+        your_contribution=0.0, age=age, year=tax_year,
+    )
+    elective_limit = match_detail["elective_limit"]
+    match_needed = match_detail["match_needed"]
     allocate("401k to full employer match", match_needed,
              "Instant 50-100% return. Never leave this on the table.")
     allocate("High-interest debt payoff", high_interest_debt,
@@ -447,10 +628,10 @@ def contribution_priority(
     allocate("Emergency fund top-up", emergency_fund_gap,
              "Cash buffer prevents you from selling investments or borrowing at 20%+ in a crisis.")
     if has_hdhp:
-        hsa_cap = 8_550 if filing_status == "married_joint" else 4_300
+        hsa_cap = tax_mod.hsa_limit(hdhp_coverage == "family", age, tax_year)
         allocate("HSA (max)", hsa_cap,
                  "Triple tax-free: deductible in, tax-free growth, tax-free out for medical. Best account that exists.")
-    limit_401k = tax_mod.contribution_limit("401k", age, tax_year) - match_needed
+    limit_401k = elective_limit - match_needed
     allocate("Max 401k/403b", max(0.0, limit_401k),
              "Tax-deferred or Roth growth; see the Roth-vs-Traditional page for which flavour.")
     ira_cap = tax_mod.contribution_limit("ira", age, tax_year)

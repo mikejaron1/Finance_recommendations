@@ -1,0 +1,4 @@
+-r requirements.txt
+yfinance==0.2.65
+gspread==6.1.4
+google-auth==2.36.0

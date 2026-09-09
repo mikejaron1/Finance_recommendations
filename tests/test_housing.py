@@ -10,7 +10,9 @@ from finrec.housing import (
     affordability,
     analyze_rental,
     buy_vs_rent,
-    sell_keep_or_rent,
+    home_sale_tax,
+    keep_rental_or_sell,
+    KeepOrSellInputs,
 )
 
 
@@ -159,42 +161,191 @@ class TestRental:
         assert r["market_alternative_after_tax"] > r["total_cash_invested"]
 
 
-class TestSellKeepOrRent:
-    def test_returns_all_three_options(self):
-        r = sell_keep_or_rent(1_000_000, 400_000, 0.035, 20, 600_000, 4_000)
-        assert set(r["options"]) == {"sell_now_and_invest", "keep_as_primary", "rent_it_out"}
-        assert r["best_option"] in r["options"]
+class TestHomeSaleTax:
+    """The old flat-15% shortcut was wrong in both directions."""
 
-    def test_section_121_exclusion_applies_when_recently_lived_in(self):
-        r = sell_keep_or_rent(1_400_000, 300_000, 0.035, 20, 700_000, 5_000,
-                              years_lived_in_last_5=5.0, filing_status="married_joint")
-        assert r["capital_gains_exclusion_available"] == pytest.approx(500_000)
+    def test_primary_residence_gain_under_exclusion_is_untaxed(self):
+        r = home_sale_tax(1_000_000, 700_000, filing_status="married_joint",
+                          ordinary_income=200_000)
+        assert r["total_tax"] == pytest.approx(0.0)
 
     def test_single_filer_gets_half_the_exclusion(self):
-        r = sell_keep_or_rent(1_400_000, 300_000, 0.035, 20, 700_000, 5_000,
-                              years_lived_in_last_5=5.0, filing_status="single")
-        assert r["capital_gains_exclusion_available"] == pytest.approx(250_000)
+        r = home_sale_tax(1_400_000, 700_000, filing_status="single", ordinary_income=200_000)
+        assert r["exclusion_available"] == pytest.approx(250_000)
+        assert r["taxable_gain"] > 0
 
-    def test_exclusion_lost_after_moving_out(self):
-        r = sell_keep_or_rent(1_400_000, 300_000, 0.035, 20, 700_000, 5_000,
-                              years_lived_in_last_5=0.0)
-        assert r["capital_gains_exclusion_available"] == 0
+    def test_exclusion_requires_recent_occupancy(self):
+        kept = home_sale_tax(1_400_000, 700_000, qualifies_for_exclusion=True,
+                             filing_status="married_joint", ordinary_income=200_000)
+        lost = home_sale_tax(1_400_000, 700_000, qualifies_for_exclusion=False,
+                             filing_status="married_joint", ordinary_income=200_000)
+        assert kept["total_tax"] < lost["total_tax"]
 
-    def test_exclusion_reduces_tax_on_sale(self):
-        kept = sell_keep_or_rent(1_400_000, 300_000, 0.035, 20, 700_000, 5_000,
-                                 years_lived_in_last_5=5.0)
-        lost = sell_keep_or_rent(1_400_000, 300_000, 0.035, 20, 700_000, 5_000,
-                                 years_lived_in_last_5=0.0)
-        assert kept["tax_if_sell_now"] < lost["tax_if_sell_now"]
-        assert kept["net_proceeds_if_sell_now"] > lost["net_proceeds_if_sell_now"]
+    def test_selling_costs_reduce_the_gain(self):
+        high = home_sale_tax(1_400_000, 600_000, selling_costs_pct=0.10,
+                             filing_status="single", ordinary_income=200_000)
+        low = home_sale_tax(1_400_000, 600_000, selling_costs_pct=0.02,
+                            filing_status="single", ordinary_income=200_000)
+        assert high["total_gain"] < low["total_gain"]
+        assert high["total_tax"] < low["total_tax"]
 
-    def test_high_rent_makes_renting_out_attractive(self):
-        r = sell_keep_or_rent(800_000, 200_000, 0.035, 20, 750_000, 9_000)
-        assert r["options"]["rent_it_out"] > r["options"]["keep_as_primary"]
+    def test_improvements_raise_basis_and_cut_tax(self):
+        without = home_sale_tax(1_400_000, 600_000, filing_status="single", ordinary_income=200_000)
+        with_imp = home_sale_tax(1_400_000, 600_000, improvements=150_000,
+                                 filing_status="single", ordinary_income=200_000)
+        assert with_imp["adjusted_basis"] == pytest.approx(750_000)
+        assert with_imp["total_tax"] < without["total_tax"]
+
+    def test_depreciation_is_recaptured_even_with_the_exclusion(self):
+        """Recapture is never covered by §121 — the classic landlord surprise."""
+        r = home_sale_tax(1_000_000, 700_000, depreciation_taken=100_000,
+                          qualifies_for_exclusion=True, filing_status="married_joint",
+                          ordinary_income=200_000)
+        assert r["recapture_gain"] == pytest.approx(100_000)
+        assert r["recapture_tax"] > 0
+
+    def test_recapture_is_capped_at_25_percent(self):
+        r = home_sale_tax(2_000_000, 700_000, depreciation_taken=200_000,
+                          qualifies_for_exclusion=False, filing_status="single",
+                          ordinary_income=600_000)
+        assert r["recapture_tax"] <= 200_000 * 0.25 + 1
+
+    def test_rate_rises_with_income_rather_than_being_flat(self):
+        """Same gain, different incomes: a flat 15% would give the same bill."""
+        low = home_sale_tax(900_000, 750_000, qualifies_for_exclusion=False,
+                            filing_status="single", ordinary_income=30_000)
+        high = home_sale_tax(900_000, 750_000, qualifies_for_exclusion=False,
+                             filing_status="single", ordinary_income=600_000)
+        assert low["total_gain"] == pytest.approx(high["total_gain"])
+        # Part of the gain fills the 0% bracket for the low earner...
+        assert low["effective_rate"] < 0.15
+        # ...while the high earner pays 20% plus the 3.8% surtax on all of it.
+        assert high["effective_rate"] > 0.20
+
+    def test_niit_applies_to_high_earners(self):
+        r = home_sale_tax(1_400_000, 700_000, qualifies_for_exclusion=False,
+                          filing_status="single", ordinary_income=400_000)
+        assert r["niit"] > 0
+
+    def test_state_tax_is_included(self):
+        no_state = home_sale_tax(1_400_000, 700_000, qualifies_for_exclusion=False,
+                                 filing_status="single", ordinary_income=300_000, state_rate=0.0)
+        with_state = home_sale_tax(1_400_000, 700_000, qualifies_for_exclusion=False,
+                                   filing_status="single", ordinary_income=300_000, state_rate=0.093)
+        assert with_state["total_tax"] > no_state["total_tax"]
+
+    def test_a_loss_creates_no_tax(self):
+        r = home_sale_tax(500_000, 700_000, filing_status="single", ordinary_income=200_000)
+        assert r["total_tax"] == 0
+        assert r["total_gain"] < 0
+
+    def test_components_sum_to_the_total(self):
+        r = home_sale_tax(1_600_000, 600_000, depreciation_taken=90_000,
+                          qualifies_for_exclusion=False, filing_status="married_joint",
+                          ordinary_income=300_000, state_rate=0.05)
+        assert r["total_tax"] == pytest.approx(
+            r["federal_ltcg_tax"] + r["recapture_tax"] + r["niit"] + r["state_tax"])
+
+
+class TestKeepRentalOrSell:
+    """You're moving out: rent it out, or sell and invest?"""
+
+    def base(self, **kw):
+        defaults = dict(current_value=1_200_000, mortgage_balance=500_000, mortgage_rate=0.035,
+                        remaining_years=22, purchase_price=700_000,
+                        monthly_rent_achievable=4_500, ordinary_income=300_000,
+                        horizon_years=15)
+        defaults.update(kw)
+        return keep_rental_or_sell(KeepOrSellInputs(**defaults))
+
+    def test_offers_exactly_the_two_real_choices(self):
+        r = self.base()
+        assert set(r["options"]) == {"rent_it_out", "sell_and_invest"}
+        assert r["best_option"] in r["options"]
+
+    def test_produces_a_wealth_path_for_the_chart(self):
+        r = self.base(horizon_years=10)
+        assert len(r["table"]) == 10
+        for column in ("rent_it_out_wealth", "sell_and_invest_wealth"):
+            assert column in r["table"]
+
+    def test_rent_grows_each_year(self):
+        r = self.base(rent_growth=0.04)
+        rents = r["table"]["gross_rent"].tolist()
+        assert rents == sorted(rents)
+        assert rents[-1] > rents[0] * 1.4
+
+    def test_zero_rent_growth_holds_rent_flat(self):
+        r = self.base(rent_growth=0.0)
+        rents = r["table"]["gross_rent"].tolist()
+        assert rents[0] == pytest.approx(rents[-1])
+
+    def test_higher_rent_favours_keeping(self):
+        low = self.base(monthly_rent_achievable=3_000)
+        high = self.base(monthly_rent_achievable=12_000)
+        assert high["options"]["rent_it_out"] > low["options"]["rent_it_out"]
+
+    def test_exclusion_expiry_shows_up_as_a_tax_jump(self):
+        """The §121 clock runs out ~3 years after moving out."""
+        r = self.base()
+        taxes_by_year = r["table"]["tax_if_sold_this_year"].tolist()
+        assert taxes_by_year[3] > taxes_by_year[2] * 2
+
+    def test_exclusion_value_is_quantified(self):
+        r = self.base(years_lived_in_last_5=5.0)
+        assert r["exclusion_value"] > 0
+        assert r["exclusion_deadline_year"] == 3
+
+    def test_no_exclusion_when_you_never_lived_there(self):
+        r = self.base(years_lived_in_last_5=0.0)
+        assert r["exclusion_value"] == 0
+
+    def test_depreciation_accumulates_and_is_recaptured(self):
+        r = self.base()
+        assert r["annual_depreciation"] > 0
+        # Later sales carry more recapture, so tax rises even as basis is fixed.
+        assert r["table"]["tax_if_sold_this_year"].iloc[-1] > r["table"]["tax_if_sold_this_year"].iloc[4]
 
     def test_equity_is_value_minus_balance(self):
-        r = sell_keep_or_rent(1_000_000, 400_000, 0.035, 20, 600_000, 4_000)
-        assert r["current_equity"] == pytest.approx(600_000)
+        r = self.base()
+        assert r["current_equity"] == pytest.approx(700_000)
+
+    def test_net_proceeds_account_for_costs_and_tax(self):
+        r = self.base()
+        assert r["net_proceeds_if_sell_now"] < r["current_equity"]
+
+    def test_recommendation_names_the_winner(self):
+        r = self.base()
+        assert r["best_option_label"].lower()[:4] in r["recommendation"].lower()
+
+    def test_negative_cashflow_is_flagged(self):
+        """A rental you have to subsidise must say so, in the amount it costs."""
+        r = self.base(monthly_rent_achievable=1_500)
+        assert r["first_year_cashflow"] < 0
+        text = r["recommendation"]
+        assert f"{abs(r['first_year_cashflow']):,.0f}" in text, \
+            f"the shortfall is not quantified: {text}"
+        assert "salary" in text, f"it should say where the money comes from: {text}"
+
+    def test_the_verdict_avoids_jargon(self):
+        """Plain English only: no statute numbers or trade terms in the verdict."""
+        text = self.base()["recommendation"].lower()
+        for term in ("\u00a7121", "121 exclusion", "niit", "ltcg", "capital-gains exclusion",
+                     "recapture", "basis", "depreciation"):
+            assert term not in text, f"jargon {term!r} in the verdict: {text}"
+
+    def test_the_verdict_never_says_keep(self):
+        """The user is moving out; staying is not one of the choices."""
+        for rent in (1_500, 12_000):
+            r = self.base(monthly_rent_achievable=rent)
+            text = r["recommendation"].lower()
+            for phrase in ("keep it", "keeping it", "keep the", "keep and rent", "keep & rent"):
+                assert phrase not in text, f"{phrase!r} offers staying as a choice: {text}"
+            assert "keep" not in r["best_option_label"].lower()
+
+    def test_tax_matches_the_standalone_calculator(self):
+        r = self.base()
+        assert r["tax_if_sell_now"] == pytest.approx(r["sale_now"]["total_tax"])
 
 
 class TestAffordability:

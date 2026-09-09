@@ -340,8 +340,14 @@ class TestProjectNetWorth:
         )
 
     def test_fi_probability_is_a_probability(self):
-        r = project_net_worth(DEFAULT_PROFILE, years=25, n_sims=400)
+        r = project_net_worth(
+            DEFAULT_PROFILE, years=DEFAULT_PROFILE.retirement_age - DEFAULT_PROFILE.age,
+            n_sims=400)
         assert 0.0 <= r["probability_of_fi_by_retirement"] <= 1.0
+
+    def test_retirement_probability_is_not_invented_beyond_the_horizon(self):
+        r = project_net_worth(DEFAULT_PROFILE, years=1, n_sims=400)
+        assert r["probability_of_fi_by_retirement"] is None
 
 
 class TestProjects:
@@ -356,7 +362,8 @@ class TestProjects:
         assert nem3["lifetime_savings"] < full["lifetime_savings"]
 
     def test_federal_credit_reduces_net_cost(self):
-        r = solar_analysis(SolarInputs(system_cost=30_000, federal_tax_credit=0.30))
+        r = solar_analysis(SolarInputs(system_cost=30_000, federal_tax_credit=0.30,
+                                      installation_year=2025))
         assert r["net_cost_after_incentives"] == pytest.approx(21_000)
         assert r["federal_credit_value"] == pytest.approx(9_000)
 

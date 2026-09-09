@@ -128,8 +128,10 @@ class TestRefinance:
         r = refinance_analysis(680_000, 0.075, 30, 24, 0.055, 30,
                                closing_costs=9_000, roll_costs_into_loan=False)
         assert r["break_even_month"] is not None
-        assert r["break_even_month"] * r["monthly_savings"] >= 9_000
-        assert (r["break_even_month"] - 1) * r["monthly_savings"] < 9_000
+        assert r["payment_break_even_month"] * r["monthly_savings"] >= 9_000
+        assert (r["payment_break_even_month"] - 1) * r["monthly_savings"] < 9_000
+        economic = r["table"].set_index("month")["economic_benefit"]
+        assert economic.loc[r["break_even_month"]] > 0
 
     def test_higher_rate_is_never_worth_it(self):
         r = refinance_analysis(680_000, 0.045, 30, 24, 0.075, 30, closing_costs=9_000)

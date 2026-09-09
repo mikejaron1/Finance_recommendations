@@ -3,17 +3,20 @@
 import pytest
 
 from finrec.taxes import (
+    CONTRIBUTION_LIMITS,
     FILING_STATUSES,
     ORDINARY_BRACKETS,
     SALT_CAP,
     compute_tax,
     contribution_limit,
+    employer_match,
     deduction_savings,
     gross_up,
     itemized_deduction,
     ltcg_tax,
     marginal_rate,
     payroll_tax,
+    self_employment_tax,
     standard_deduction,
     tax_on_brackets,
 )
@@ -183,7 +186,7 @@ class TestLtcg:
 
 class TestItemizedDeduction:
     def test_salt_is_capped(self):
-        d = itemized_deduction(property_tax=25_000, state_income_tax=40_000, status="single")
+        d = itemized_deduction(property_tax=25_000, state_income_tax=40_000, status="single", year=2024)
         assert d == pytest.approx(SALT_CAP["single"])
 
     def test_mortgage_interest_limited_above_debt_cap(self):
@@ -253,3 +256,77 @@ class TestMarginalRate:
 
     def test_zero_income_is_lowest_rate(self):
         assert marginal_rate(0, "single", 2025) == 0.10
+
+
+class TestSelfEmploymentTax:
+    """Someone self-employed pays both halves of FICA, then deducts one back."""
+
+    def test_a_standalone_profit_pays_both_halves(self):
+        se = self_employment_tax(60_000, 0, "single", 2025)
+        # 15.3% of 92.35% of the profit.
+        assert se["tax"] == pytest.approx(60_000 * 0.9235 * 0.153, rel=1e-6)
+        assert se["deductible_half"] == pytest.approx(se["tax"] / 2, rel=1e-6)
+
+    def test_a_big_salary_uses_up_the_social_security_band(self):
+        """A $215k salary has already paid Social Security to the cap, so the
+        business profit owes Medicare only — about 3%, not 14%."""
+        alone = self_employment_tax(60_000, 0, "single", 2025)
+        alongside = self_employment_tax(60_000, 215_000, "single", 2025)
+        assert alongside["social_security"] == 0
+        assert alongside["tax"] < alone["tax"] / 3
+        # Medicare at 2.9%, plus the 0.9% surtax this salary has already passed
+        # the threshold for -- but the surtax is not deductible.
+        base = alongside["taxable_base"]
+        assert alongside["tax"] == pytest.approx(base * 0.038, rel=1e-6)
+        assert alongside["deductible_half"] == pytest.approx(base * 0.029 / 2, rel=1e-6)
+
+    def test_a_loss_owes_nothing(self):
+        se = self_employment_tax(-180_000, 215_000, "married_joint", 2025)
+        assert se["tax"] == 0
+        assert se["deductible_half"] == 0
+
+    def test_a_loss_reduces_taxable_income(self):
+        """The whole point: a bad year for the business is a low-tax year."""
+        good = compute_tax(295_000, "married_joint", 2025, include_payroll=False)
+        bad = compute_tax(115_000, "married_joint", 2025, include_payroll=False,
+                          self_employment_income=-180_000)
+        assert bad.taxable_income == pytest.approx(good.taxable_income - 180_000)
+        assert bad.marginal_rate < good.marginal_rate - 0.05
+
+    def test_above_the_line_deductions_come_off_agi(self):
+        with_ded = compute_tax(300_000, "single", 2025, above_the_line=20_000, include_payroll=False)
+        without = compute_tax(300_000, "single", 2025, include_payroll=False)
+        assert with_ded.agi == pytest.approx(without.agi - 20_000)
+        assert with_ded.federal_tax < without.federal_tax
+
+
+class TestEmployerMatch:
+    """A match is not simply a percentage of household pay."""
+
+    def test_a_plain_formula_is_the_percentage_of_pay(self):
+        m = employer_match(200_000, 0.05, 0.06, your_contribution=23_500, year=2025)
+        assert m["amount"] == pytest.approx(10_000)
+        assert m["binding"] == "plan formula"
+
+    def test_a_plan_dollar_cap_wins_when_it_is_lower(self):
+        m = employer_match(300_000, 0.05, 0.06, your_contribution=23_500,
+                           dollar_cap=11_000, year=2025)
+        assert m["amount"] == pytest.approx(11_000)
+        assert "dollar cap" in m["binding"]
+        assert m["uncapped"] > m["amount"]
+
+    def test_the_irs_pay_cap_bites_on_a_very_high_salary(self):
+        """Only $350,000 of pay counts, so 5% cannot exceed $17,500."""
+        m = employer_match(900_000, 0.05, 0.05, your_contribution=23_500, year=2025)
+        assert m["amount"] == pytest.approx(17_500)
+        assert m["amount"] < 0.05 * 900_000
+
+    def test_the_overall_limit_caps_the_total_going_in(self):
+        m = employer_match(600_000, 0.20, 0.20, your_contribution=60_000, year=2025)
+        assert m["amount"] == pytest.approx(CONTRIBUTION_LIMITS[2025]["total_415c"] - 60_000)
+        assert "415" in m["binding"]
+
+    def test_no_dollar_cap_means_no_dollar_limit(self):
+        """Passing 0 must not be read as 'the employer matches nothing'."""
+        m = employer_match(200_000, 0.05, 0.06, your_contribution=23_500, dollar_cap=None)
+        assert m["amount"] > 0

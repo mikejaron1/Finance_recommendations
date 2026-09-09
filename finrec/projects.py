@@ -24,7 +24,7 @@ import pandas as pd
 
 from .core import irr, npv
 
-__all__ = ["RENOVATION_ROI", "solar_analysis", "turf_analysis", "renovation_analysis", "compare_projects"]
+__all__ = ["RENOVATION_ROI", "solar_credit_rate", "solar_analysis", "turf_analysis", "renovation_analysis", "compare_projects"]
 
 # Typical national cost-recouped-at-resale figures. Regional variation is
 # large; these are starting points, not appraisals.
@@ -45,14 +45,26 @@ RENOVATION_ROI: dict[str, dict] = {
     "hvac_replacement": {"label": "HVAC replacement", "typical_cost": 12_000, "resale_recoup": 0.60, "lifespan": 18},
 }
 
-FEDERAL_SOLAR_CREDIT = 0.30  # Residential Clean Energy Credit
+FEDERAL_SOLAR_CREDIT = 0.0  # New installations in 2026 are no longer eligible.
+SOLAR_CREDIT_SOURCE = "https://www.irs.gov/credits-deductions/residential-clean-energy-credit"
+
+
+def solar_credit_rate(installation_year: int) -> float:
+    """Residential credit for completed installations; historical 2022–25 only.
+
+    Earlier years require their own historical-law calculation rather than a
+    guessed incentive. IRS guidance verified September 8, 2026.
+    """
+    if installation_year < 2022:
+        raise ValueError("Solar credit calculations support installation years 2022 onward")
+    return 0.30 if installation_year <= 2025 else 0.0
 
 
 @dataclass
 class SolarInputs:
     system_cost: float = 28_000
     system_size_kw: float = 8.0
-    federal_tax_credit: float = FEDERAL_SOLAR_CREDIT
+    federal_tax_credit: float | None = None
     state_local_rebate: float = 0.0
     annual_production_kwh_per_kw: float = 1_400  # varies hugely by region
     current_rate_per_kwh: float = 0.32           # CA is ~0.32; US average ~0.17
@@ -70,6 +82,8 @@ class SolarInputs:
     net_metering_credit_rate: float = 1.0        # 1.0 = full retail; NEM 3.0 ~0.25
     self_consumption_rate: float = 0.55          # share used directly vs exported
     discount_rate: float = 0.078
+    installation_year: int = 2026
+    federal_credit_eligible: bool = True
 
 
 def solar_analysis(i: SolarInputs) -> dict:
@@ -80,7 +94,14 @@ def solar_analysis(i: SolarInputs) -> dict:
     power (NEM 3.0 pays roughly a quarter of retail for exports), and panel
     degradation compounds against rising utility rates.
     """
-    net_cost = i.system_cost * (1 - i.federal_tax_credit) - i.state_local_rebate
+    statutory_rate = solar_credit_rate(i.installation_year)
+    requested_rate = statutory_rate if i.federal_tax_credit is None else i.federal_tax_credit
+    if not 0 <= requested_rate <= 1 or not 0 <= i.state_local_rebate <= i.system_cost:
+        raise ValueError("invalid incentive rate or rebate")
+    credit_rate = min(requested_rate, statutory_rate) if i.federal_credit_eligible else 0.0
+    credit_basis = i.system_cost - i.state_local_rebate
+    credit_value = credit_basis * credit_rate
+    net_cost = credit_basis - credit_value
     annual_production = i.system_size_kw * i.annual_production_kwh_per_kw
 
     rows = []
@@ -132,7 +153,16 @@ def solar_analysis(i: SolarInputs) -> dict:
     return {
         "table": table,
         "net_cost_after_incentives": net_cost,
-        "federal_credit_value": i.system_cost * i.federal_tax_credit,
+        "federal_credit_value": credit_value,
+        "federal_credit_rate": credit_rate,
+        "installation_year": i.installation_year,
+        "credit_source": SOLAR_CREDIT_SOURCE,
+        "assumptions": [
+            "No federal residential clean energy credit for installations after December 31, 2025.",
+            "Historical eligible installations assume qualified ownership, costs, and sufficient tax liability.",
+            "Credit modeled at inception, not tax-filing date; unused credit carryforwards not modeled.",
+            "Only caller-confirmed local rebates included; rebates conservatively reduce credit basis.",
+        ],
         "annual_production_kwh": annual_production,
         "year_1_savings": float(table["gross_savings"].iloc[0]),
         "lifetime_savings": float(table["net_cashflow"].sum()),

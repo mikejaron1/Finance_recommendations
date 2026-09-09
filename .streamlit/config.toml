@@ -1,0 +1,24 @@
+# The custom cards, hero and answer panels use light surfaces, so the app must
+# not follow the visitor's OS dark mode — that combination renders Streamlit's
+# white body text on our white cards.
+[theme]
+base = "light"
+primaryColor = "#0E7C5A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F8F7"
+textColor = "#0F1A16"
+borderColor = "#E4E8E6"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+address = "127.0.0.1"
+# Serves app/static/ at /app/static/. Used for the self-hosted Inter webfont:
+# linking Google Fonts would send every visitor's IP to a third party on each
+# page load, which contradicts this app's local-only promise.
+enableStaticServing = true
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = true

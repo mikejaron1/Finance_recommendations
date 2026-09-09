@@ -10,7 +10,9 @@ free money → kill guaranteed-loss debt → tax-advantaged growth → optimise.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import date
 from enum import IntEnum
 
 import numpy as np
@@ -52,9 +54,26 @@ class Recommendation:
     lifetime_impact: float = 0.0    # compounded to retirement
     confidence: str = "high"        # high | medium | low
     tags: list[str] = field(default_factory=list)
+    # Set when this advice argues with something the user wrote about
+    # themselves; holds their stated reason. See finrec.notes_review.
+    conflicts_with_notes: str = ""
+    conflict_source: str = ""       # "notes" (deterministic) or "ai"
+
+    @property
+    def action_id(self) -> str:
+        """A stable handle for this recommendation.
+
+        Titles carry live dollar figures, so they can't identify an item across
+        runs — tick "Max your 401k — saves $8,400" today and a raise would make
+        it a different string tomorrow, resurrecting an item you'd completed.
+        Stripping the numbers leaves a slug that survives recalculation.
+        """
+        stem = re.sub(r"[\d,.$%]+", "", f"{self.category}-{self.title}")
+        return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:60]
 
     def as_row(self) -> dict:
         return {
+            "id": self.action_id,
             "priority": PRIORITY_LABELS[self.priority],
             "priority_rank": int(self.priority),
             "title": self.title,
@@ -74,8 +93,16 @@ def _compound(amount: float, years: int, rate: float) -> float:
     return amount * (((1 + rate) ** years - 1) / rate)
 
 
-def generate_recommendations(profile: Profile) -> list[Recommendation]:
-    """Produce the full ranked recommendation list for a profile."""
+def generate_recommendations(profile: Profile, *, review_notes: bool = True,
+                             use_llm_review: bool = False) -> list[Recommendation]:
+    """Produce the full ranked recommendation list for a profile.
+
+    The rules below reason only from numbers. ``review_notes`` then checks the
+    result against anything the user wrote about themselves, so the page stops
+    telling someone to invest cash they have already explained they are holding
+    back on purpose. The LLM half of that review is opt-in because it costs a
+    network round trip; the keyword half always runs.
+    """
     p = profile
     recs: list[Recommendation] = []
     years_to_retirement = max(1, p.retirement_age - p.age)
@@ -129,7 +156,7 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
                 f"against a {r:.1%} expected return costs roughly ${drag:,.0f}/yr in foregone growth, "
                 "and inflation erodes the rest."
             ),
-            action="Move the surplus into your target allocation, dollar-cost averaging over 3-6 months if a lump sum feels uncomfortable.",
+            action="Move the surplus into your target allocation, dollar-cost averaging over 3-6 months if a lump sum feels uncomfortable. Keep the emergency fund itself in a high-yield account or Treasury money-market fund — T-bill interest is exempt from state income tax.",
             annual_impact=drag,
             lifetime_impact=ef["surplus"] * ((1 + r) ** years_to_retirement - (1.042) ** years_to_retirement),
         ))
@@ -151,19 +178,26 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
         ))
 
     # ---------------------------------------------------------------- HIGH
-    match_value = min(p.employer_match_pct, p.employer_match_limit_pct) * p.gross_income
-    if match_value > 0:
+    # The employer-match shortfall is handled in the CRITICAL block below,
+    # where it can compare the match against what you actually contribute.
+    # All that's left here is confirming it when you're already capturing it.
+    match_detail = taxes.employer_match(
+        p.salary, p.employer_match_pct, p.employer_match_limit_pct,
+        your_contribution=p.annual_401k_contribution,
+        dollar_cap=p.employer_match_dollar_cap or None, age=p.age, year=p.tax_year)
+    match_value = match_detail["earned_amount"]
+    if match_value > 0 and match_value >= match_detail["available_amount"] - 0.01:
         recs.append(Recommendation(
-            title=f"Capture the full employer match (${match_value:,.0f}/yr)",
-            priority=Priority.HIGH,
+            title=f"You're capturing the full employer match (${match_value:,.0f}/yr)",
+            priority=Priority.INFO,
             category="Retirement",
             rationale=(
-                "An employer match is an immediate 100% return on your contribution. No investment "
-                "available anywhere matches it. Anything less than the full match is leaving cash on the table."
+                "An employer match is an immediate 100% return on your contribution — no investment "
+                "anywhere matches it. You're contributing enough to receive all of it."
             ),
-            action=f"Set your 401k deferral to at least {p.employer_match_limit_pct:.0%} of salary.",
+            action="No action needed. Re-check after any salary change, since the match is a "
+                   "percentage of pay.",
             annual_impact=match_value,
-            lifetime_impact=_compound(match_value, years_to_retirement, r),
         ))
 
     if p.investment_fee > 0.005:
@@ -184,43 +218,150 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
             lifetime_impact=p.invested_assets * ((1 + r) ** years_to_retirement - (1 + r - excess_fee) ** years_to_retirement),
         ))
 
-    tax_result = taxes.compute_tax(p.household_income, p.filing_status, p.tax_year, state=p.state)
-    if p.traditional_401k + p.roth_balance >= 0 and tax_result.marginal_rate >= 0.24:
-        limit = taxes.contribution_limit("401k", p.age, p.tax_year)
-        savings = taxes.deduction_savings(
-            p.household_income, limit, p.filing_status, p.tax_year,
-            taxes.STATE_TOP_RATES.get(p.state.upper(), 0.0),
-        )
+    tax_result = p.tax_picture()
+    state_rate = taxes.STATE_TOP_RATES.get(p.state.upper(), 0.0)
+    limit_401k = taxes.contribution_limit("401k", p.age, p.tax_year)
+
+    # Employer match first — it outranks everything else in this function.
+    # A dollar of match is an instant 100% return, which no tax deduction,
+    # debt paydown or market assumption can approach.
+    match_cap = match_detail["available_amount"]
+    if match_cap > 0:
+        contributed = p.annual_401k_contribution
+        needed = match_detail["elective_contribution"] + match_detail["match_needed"]
+        if match_value < match_cap - 0.01:
+            forgone = match_cap - match_value
+            recs.append(Recommendation(
+                title=f"You're leaving ${forgone:,.0f}/yr of employer match on the table",
+                priority=Priority.CRITICAL,
+                category="Retirement",
+                rationale=(
+                    f"Your employer matches {p.employer_match_pct:.0%} of salary up to "
+                    f"{p.employer_match_limit_pct:.0%}, which needs ${needed:,.0f} of deferrals to capture. "
+                    f"You're contributing ${contributed:,.0f}. The shortfall is an immediate 100% return "
+                    "you are declining — nothing else in this plan pays that."
+                ),
+                action=f"Raise your 401k deferral to at least ${needed:,.0f}/yr "
+                       f"({p.employer_match_limit_pct:.0%} of salary) before any other investing.",
+                annual_impact=forgone,
+                lifetime_impact=_compound(forgone, years_to_retirement, r),
+                tags=["401k", "match"],
+            ))
+
+    room_401k = min(limit_401k, max(0.0, p.salary)) - p.annual_401k_contribution
+    if room_401k > 500 and tax_result.marginal_rate >= 0.24:
+        saved = tax_result.total_tax - p.tax_picture(
+            pretax_deferral=tax_result.pretax_deferral + room_401k).total_tax
+        savings = {"tax_saved": saved, "effective_savings_rate": saved / room_401k}
         recs.append(Recommendation(
-            title=f"Max your 401k — saves ${savings['tax_saved']:,.0f} in tax this year",
+            title=f"${room_401k:,.0f} of 401k room left — worth ${savings['tax_saved']:,.0f} in tax",
             priority=Priority.HIGH,
             category="Tax",
             rationale=(
-                f"At a {tax_result.marginal_rate:.0%} federal marginal rate (plus state), deferring the full "
-                f"${limit:,.0f} limit cuts your tax bill by ${savings['tax_saved']:,.0f} — an effective "
+                f"You're putting in ${p.annual_401k_contribution:,.0f} of the ${limit_401k:,.0f} allowed. "
+                f"At a {tax_result.marginal_rate:.0%} federal marginal rate plus state, filling the "
+                f"remaining room cuts this year's tax by ${savings['tax_saved']:,.0f} — an effective "
                 f"{savings['effective_savings_rate']:.0%} instant return before any market growth."
             ),
-            action=f"Increase deferrals to hit the ${limit:,.0f} annual limit.",
+            action=f"Increase deferrals by ${room_401k / 12:,.0f}/month to reach the ${limit_401k:,.0f} limit.",
             annual_impact=savings["tax_saved"],
             lifetime_impact=_compound(savings["tax_saved"], years_to_retirement, r),
+            tags=["401k"],
         ))
-
-    if p.has_hdhp and p.hsa_balance == 0:
-        hsa_limit = 8_550 if p.filing_status == "married_joint" else 4_300
-        hsa_savings = hsa_limit * (tax_result.marginal_rate + 0.0765)
+    elif p.annual_401k_contribution >= limit_401k:
         recs.append(Recommendation(
-            title=f"Max your HSA (${hsa_limit:,.0f}) and invest it — don't spend it",
-            priority=Priority.HIGH,
+            title="401k is maxed — next dollars go to backdoor Roth, then taxable",
+            priority=Priority.INFO,
             category="Tax",
             rationale=(
-                "The HSA is the only triple-tax-free account: deductible going in, tax-free growth, and "
-                "tax-free out for medical expenses. It also escapes FICA when funded via payroll, which "
-                f"no other account does — worth about ${hsa_savings:,.0f}/yr to you."
+                f"You're at the ${limit_401k:,.0f} elective limit. The remaining tax-advantaged space is "
+                "a backdoor Roth IRA, a mega-backdoor Roth if your plan allows after-tax contributions "
+                f"with in-plan conversion (up to the ${taxes.contribution_limit('total_415c', 40, p.tax_year):,.0f} "
+                "total 415(c) cap), and an HSA if you're on a high-deductible plan."
             ),
-            action="Fund it via payroll deduction, invest the balance, and pay current medical costs out of pocket so it compounds.",
-            annual_impact=hsa_savings,
-            lifetime_impact=_compound(hsa_savings, years_to_retirement, r),
+            action="Check whether your plan permits after-tax contributions and in-service conversion.",
+            tags=["401k"],
         ))
+
+    if p.has_hdhp:
+        cap_hsa = taxes.hsa_limit(p.hdhp_coverage == "family", p.age, p.tax_year)
+        room_hsa = cap_hsa - p.annual_hsa_contribution
+        if room_hsa > 250:
+            # FICA is the part people miss: payroll-funded HSA dollars escape
+            # Social Security and Medicare tax, which a 401k deferral does not.
+            hsa_savings = tax_result.total_tax - p.tax_picture(
+                pretax_deferral=tax_result.pretax_deferral + room_hsa).total_tax
+            recs.append(Recommendation(
+                title=f"Fund ${room_hsa:,.0f} more into your HSA — the only triple-tax-free account",
+                priority=Priority.HIGH,
+                category="Tax",
+                rationale=(
+                    f"You're contributing ${p.annual_hsa_contribution:,.0f} of a ${cap_hsa:,.0f} limit. "
+                    "An HSA is deductible going in, grows tax-free, and comes out tax-free for medical "
+                    f"costs. The estimated income-tax saving is ${hsa_savings:,.0f}/yr; "
+                    "eligible payroll contributions may save additional payroll tax."
+                ),
+                action="Fund it by payroll deduction, invest the balance rather than holding cash, and "
+                       "pay current medical costs out of pocket so it compounds untouched.",
+                annual_impact=hsa_savings,
+                lifetime_impact=_compound(hsa_savings, years_to_retirement, r),
+                tags=["hsa"],
+            ))
+        elif p.hsa_balance > 0 and p.hsa_balance < cap_hsa:
+            recs.append(Recommendation(
+                title="Invest your HSA balance instead of leaving it in cash",
+                priority=Priority.MEDIUM,
+                category="Tax",
+                rationale=(
+                    "Most HSA providers park the balance in a near-zero-interest cash account by default. "
+                    "Over a long horizon that forfeits the tax-free growth that makes the account worth "
+                    "using in the first place."
+                ),
+                action="Move the balance above your provider's cash minimum into an index fund.",
+                confidence="medium",
+                tags=["hsa"],
+            ))
+
+    if p.dependents > 0:
+        exclusion = taxes.gift_tax_exclusion(p.tax_year)
+        if p.annual_college_contribution <= 0:
+            years_to_college = max(1, 18 - 8)
+            projected = _compound(2_400, years_to_college, r) if years_to_college else 0.0
+            recs.append(Recommendation(
+                title=f"No 529 contributions with {p.dependents} dependent"
+                      f"{'s' if p.dependents != 1 else ''}",
+                priority=Priority.MEDIUM,
+                category="Education",
+                rationale=(
+                    "A 529 grows tax-free and comes out tax-free for qualified education costs, and "
+                    + (f"{p.state.upper()} " if state_rate > 0 else "many states ")
+                    + "offer a state income-tax deduction on top. Unused balances can now be rolled to a "
+                    "Roth IRA for the beneficiary (up to $35,000 lifetime, subject to conditions), which "
+                    "removes the old over-funding risk that kept people out."
+                ),
+                action=f"Open a 529 and start with $200/month — about ${projected:,.0f} by college age. "
+                       f"Contributions up to ${exclusion:,.0f} per child per donor avoid gift-tax filing.",
+                annual_impact=0.0,
+                lifetime_impact=projected,
+                confidence="medium",
+                tags=["529"],
+            ))
+        elif p.annual_college_contribution > 0 and state_rate > 0:
+            deduction = min(p.annual_college_contribution, 10_000) * state_rate
+            recs.append(Recommendation(
+                title=f"Claim your state 529 deduction (~${deduction:,.0f}/yr)",
+                priority=Priority.LOW,
+                category="Education",
+                rationale=(
+                    f"You're contributing ${p.annual_college_contribution:,.0f}/yr. Many states deduct "
+                    "529 contributions from state taxable income, and some require you to use the "
+                    "in-state plan to qualify."
+                ),
+                action="Check your state's plan rules and claim the deduction at filing.",
+                annual_impact=deduction,
+                confidence="low",
+                tags=["529"],
+            ))
 
     # ---------------------------------------------------------------- MEDIUM
     if p.mortgage_balance > 0 and p.mortgage_rate > r:
@@ -293,9 +434,15 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
             gross_income=p.household_income, filing_status=p.filing_status, state=p.state,
             annual_contribution=taxes.contribution_limit("401k", p.age, p.tax_year),
             employer_match_pct=p.employer_match_pct, employer_match_limit_pct=p.employer_match_limit_pct,
+            match_eligible_pay=p.salary,
+            employer_match_dollar_cap=p.employer_match_dollar_cap or None,
+            self_employment_income=p.self_employment_income,
+            itemized_deductions=tax_result.deduction_taken,
+            above_the_line_deductions=p.above_the_line_deductions, w2_wages=p.w2_wages,
             existing_traditional_balance=p.traditional_401k, existing_roth_balance=p.roth_balance,
             expected_return=p.expected_return, inflation=p.inflation,
-            desired_retirement_spending=p.desired_retirement_spending, tax_year=p.tax_year,
+            desired_retirement_spending=p.desired_retirement_spending,
+            spending_in_current_dollars=True, tax_year=p.tax_year,
         ))
         recs.append(Recommendation(
             title=f"Favour {'Roth' if rvt['winner'] == 'roth' else 'pre-tax (Traditional)'} contributions",
@@ -350,18 +497,176 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
         ))
 
     if p.dependents > 0:
+        cover = p.household_income * 10
         recs.append(Recommendation(
-            title="Open a 529 and confirm term life coverage",
+            title=f"Confirm term life cover of about {cover / 1_000_000:.1f}M",
             priority=Priority.MEDIUM,
             category="Family",
             rationale=(
-                f"With {p.dependents} dependent(s), 529 growth is tax-free for education and many states "
-                "add a deduction. Separately, term life should cover 10-12x income until the kids are "
-                "independent — it costs a fraction of whole life."
-            ),
-            action="Fund a 529 monthly and buy 20-year level term life at 10-12x income.",
+                f"With {p.dependents} dependent(s), term life should replace 10-12x income until they're "
+                "independent — roughly ${:,.0f} for you. Level 20-year term costs a small fraction of "
+                "whole life for the same death benefit; the investment component bundled into permanent "
+                "policies is the expensive part and you can do it better yourself."
+            ).format(cover),
+            action=f"Get quotes for 20-year level term at ${cover:,.0f}, and check what your employer "
+                   "policy actually covers — it usually ends when the job does.",
             confidence="high",
+            tags=["insurance"],
         ))
+
+    # ---- Debt other than cards and mortgage --------------------------------
+    for balance, rate, name in ((p.auto_loans, p.auto_loan_rate, "auto loan"),
+                                (p.student_loans, p.student_loan_rate, "student loan")):
+        if balance > 0 and rate > r:
+            recs.append(Recommendation(
+                title=f"Your {name} at {rate:.2%} beats your expected {r:.1%} return",
+                priority=Priority.MEDIUM,
+                category="Debt",
+                rationale=(
+                    f"Paying down ${balance:,.0f} at {rate:.2%} is a guaranteed, risk-free return of "
+                    f"{rate:.2%}. Your portfolio's {r:.1%} is an expectation with a wide distribution "
+                    "around it. Guaranteed beats hoped-for at the same headline number, and here the "
+                    "guaranteed one is also higher."
+                    + (" Check for PSLF or income-driven forgiveness before accelerating student loans — "
+                       "extra payments reduce the amount forgiven." if name == "student loan" else "")
+                ),
+                action=f"Direct surplus cash to the {name} once you've captured the employer match "
+                       "and cleared any card debt.",
+                annual_impact=balance * (rate - r),
+                confidence="medium",
+                tags=["debt"],
+            ))
+
+    # ---- Housing cost burden ----------------------------------------------
+    housing_monthly = p.monthly_housing_cost
+    owns = p.mortgage_balance > 0 or p.home_value > 0
+    if housing_monthly > 0 and p.household_income > 0:
+        burden = housing_monthly * 12 / p.household_income
+        if burden > 0.33:
+            recs.append(Recommendation(
+                title=f"Housing takes {burden:.0%} of gross income",
+                priority=Priority.MEDIUM if burden < 0.45 else Priority.HIGH,
+                category="Housing",
+                rationale=(
+                    f"${housing_monthly:,.0f}/month is {burden:.0%} of gross pay, above the 28-33% that "
+                    "keeps a budget resilient. Housing is the hardest cost to cut quickly, so a high "
+                    "share is what turns a job loss into a forced move or a sold portfolio."
+                    + (" That figure includes property tax and insurance, not just principal and "
+                       "interest." if owns else "")
+                ),
+                action=("Treat this as the constraint it is: avoid adding fixed costs, and make housing "
+                        "the first thing you revisit at renewal or if you move."),
+                confidence="medium",
+                tags=["housing"],
+            ))
+
+    # ---- Home projects that are actually investments -----------------------
+    recs.extend(_home_project_recommendations(p, r))
+
+    # ---- Backdoor Roth -----------------------------------------------------
+    ira_cap = taxes.contribution_limit("ira", p.age, p.tax_year)
+    if p.annual_roth_contribution < ira_cap and p.household_income > 0:
+        high_earner = p.household_income > (236_000 if p.filing_status == "married_joint" else 150_000)
+        recs.append(Recommendation(
+            title=("Use the backdoor Roth — you're over the direct contribution limit"
+                   if high_earner else f"You have ${ira_cap - p.annual_roth_contribution:,.0f} of Roth IRA room"),
+            priority=Priority.MEDIUM,
+            category="Retirement",
+            rationale=(
+                (f"At ${p.household_income:,.0f} you're phased out of direct Roth contributions, but the "
+                 "backdoor route — non-deductible traditional IRA, then convert — has no income limit. "
+                 "Watch the pro-rata rule: existing pre-tax IRA balances make the conversion partly "
+                 "taxable, though 401k balances don't count."
+                 ) if high_earner else
+                (f"Roth contributions grow and come out tax-free, and the contributions themselves can be "
+                 f"withdrawn any time without tax or penalty — which makes it a viable second-line "
+                 f"emergency reserve while it's also your retirement money.")
+            ),
+            action=f"Contribute ${ira_cap - p.annual_roth_contribution:,.0f} before the filing deadline"
+                   + (" via a non-deductible IRA and immediate conversion." if high_earner else "."),
+            confidence="medium" if high_earner else "high",
+            tags=["roth"],
+        ))
+
+    # ---- Liability exposure ------------------------------------------------
+    if p.net_worth > 1_000_000:
+        recs.append(Recommendation(
+            title="Umbrella liability cover is the cheapest insurance you can buy",
+            priority=Priority.LOW,
+            category="Insurance",
+            rationale=(
+                f"With a net worth around ${p.net_worth:,.0f}, a judgment beyond your auto and home "
+                "liability limits reaches your savings. Umbrella policies typically cost $150-$400/yr "
+                "per $1M because claims are rare — but the loss they cover is the one that ends a plan."
+            ),
+            action=f"Add ${max(1, round(p.net_worth / 1_000_000)):,.0f}M of umbrella cover through your "
+                   "existing home/auto insurer.",
+            confidence="medium",
+            tags=["insurance"],
+        ))
+
+    # ---- Estate basics -----------------------------------------------------
+    if p.net_worth > 500_000 or p.dependents > 0:
+        recs.append(Recommendation(
+            title="Beneficiaries and a will — the part everyone postpones",
+            priority=Priority.LOW,
+            category="Estate",
+            rationale=(
+                "Retirement account beneficiary designations override your will, and stale ones (an "
+                "ex-spouse, a deceased parent, or blank) are the single most common estate mistake. "
+                + ("With dependents you also need named guardians, which only a will can do."
+                   if p.dependents > 0 else "A revocable trust also keeps your estate out of probate.")
+            ),
+            action="Review beneficiaries on every retirement and brokerage account this month, then "
+                   "put a will "
+                   + ("and guardianship nomination " if p.dependents > 0 else "")
+                   + "in place.",
+            confidence="high",
+            tags=["estate"],
+        ))
+
+    # ---- Are you actually on track? ---------------------------------------
+    if p.household_income > 0 and years_to_retirement > 0:
+        total_saved = (p.annual_401k_contribution + p.annual_roth_contribution
+                       + p.annual_hsa_contribution + p.annual_taxable_contribution
+                       + p.salary * min(p.employer_match_pct, p.employer_match_limit_pct))
+        projected = (p.invested_assets * (1 + r) ** years_to_retirement
+                     + (total_saved * (((1 + r) ** years_to_retirement - 1) / r) if r else 0))
+        need = max(0.0, p.desired_retirement_spending - p.other_retirement_income) * 25
+        if need > 0 and projected < need:
+            shortfall_annual = (need - projected) * (r / ((1 + r) ** years_to_retirement - 1)) if r else 0
+            recs.append(Recommendation(
+                title=f"On track for {projected / need:.0%} of your retirement target",
+                priority=Priority.HIGH if projected < need * 0.7 else Priority.MEDIUM,
+                category="Retirement",
+                rationale=(
+                    f"Spending ${p.desired_retirement_spending:,.0f}/yr needs roughly ${need:,.0f} at a 4% "
+                    f"withdrawal rate. Your current balances plus ${total_saved:,.0f}/yr of contributions "
+                    f"project to ${projected:,.0f} by {p.retirement_age}. The gap is ${need - projected:,.0f}."
+                ),
+                action=f"Raise annual savings by about ${shortfall_annual:,.0f} "
+                       f"(${shortfall_annual / 12:,.0f}/month), retire later, or plan to spend less — "
+                       "the Retirement page lets you test each.",
+                annual_impact=0.0,
+                lifetime_impact=need - projected,
+                confidence="medium",
+                tags=["retirement"],
+            ))
+        elif need > 0:
+            recs.append(Recommendation(
+                title=f"You're on track — projected {projected / need:.0%} of your target",
+                priority=Priority.INFO,
+                category="Retirement",
+                rationale=(
+                    f"Current balances plus ${total_saved:,.0f}/yr project to ${projected:,.0f} by age "
+                    f"{p.retirement_age}, against the ${need:,.0f} that supports "
+                    f"${p.desired_retirement_spending:,.0f}/yr of spending. This assumes a steady "
+                    f"{r:.1%} return; the Retirement page runs it against real market variability."
+                ),
+                action="Keep the contribution rate steady and revisit after any income change.",
+                confidence="medium",
+                tags=["retirement"],
+            ))
 
     if p.home_value > 0 and p.home_equity > p.invested_assets:
         recs.append(Recommendation(
@@ -377,6 +682,12 @@ def generate_recommendations(profile: Profile) -> list[Recommendation]:
             confidence="medium",
         ))
 
+    if review_notes and getattr(profile, "context_notes", ""):
+        from .notes_review import apply_conflicts, review_against_notes
+        apply_conflicts(recs, review_against_notes(
+            recs, profile.context_notes, use_llm=use_llm_review))
+
+    # Sorted after the review so demoted advice actually moves down the page.
     recs.sort(key=lambda x: (int(x.priority), -x.lifetime_impact, -x.annual_impact))
     return recs
 
@@ -410,9 +721,10 @@ def financial_health_score(profile: Profile) -> dict:
 
     sr = p.savings_rate
     components["Savings rate"] = {
-        "score": min(100.0, sr / 0.20 * 100),
+        "score": max(0.0, min(100.0, sr / 0.20 * 100)),
         "weight": 0.25,
-        "detail": f"{sr:.0%} of gross income (20%+ is strong)",
+        "detail": (f"{sr:.0%} of gross income — you're spending more than you earn"
+                   if sr < 0 else f"{sr:.0%} of gross income (20%+ is strong)"),
     }
 
     dti = p.debt_to_income
@@ -423,9 +735,9 @@ def financial_health_score(profile: Profile) -> dict:
     }
 
     components["Retirement readiness"] = {
-        "score": min(100.0, p.fi_progress * 100 * (p.age / max(p.retirement_age, 1)) ** -0.5 if p.age else 0),
+        "score": min(100.0, p.fi_progress_by_retirement * 100 * (p.age / max(p.retirement_age, 1)) ** -0.5 if p.age else 0),
         "weight": 0.20,
-        "detail": f"{p.fi_progress:.0%} of your ${p.fi_number:,.0f} FI number",
+        "detail": f"{p.fi_progress_by_retirement:.0%} of the ${p.fi_number:,.0f} you need by {p.retirement_age}",
     }
 
     invested = max(p.invested_assets, 1)
@@ -467,43 +779,108 @@ def project_net_worth(profile: Profile, years: int = 30, n_sims: int = 2_000) ->
     about $2.4M of purchasing power at 2.5% inflation, and quoting the nominal
     number (as the notebook did) badly misleads.
     """
-    p = profile
-    assumptions = MarketAssumptions(
-        mean_return=p.expected_return, volatility=p.volatility, inflation_mean=p.inflation
-    )
-    paths = simulate_wealth(
-        initial=p.invested_assets,
-        annual_contribution=max(0.0, p.annual_savings),
-        years=years,
-        assumptions=assumptions,
-        n_sims=n_sims,
-        contribution_growth=p.income_growth,
-        annual_fee=p.investment_fee,
-        real_terms=True,
-    )
-    home_equity_path = np.array([
-        p.home_value * (1 + p.home_appreciation) ** t / (1 + p.inflation) ** t for t in range(years + 1)
-    ]) - p.mortgage_balance
+    from .scenario import Scenario, baseline_scenario, simulate_scenario
 
-    fi_year = None
-    median = np.median(paths, axis=0)
-    for t, value in enumerate(median):
-        if value >= p.fi_number:
-            fi_year = t
-            break
+    scenario = Scenario.from_dict(profile.active_scenario) if profile.active_scenario else baseline_scenario(profile)
+    result = simulate_scenario(profile, scenario, years=years, n_sims=n_sims)
+    retirement_index = max(0, profile.retirement_age - profile.age)
+    probability = None
+    if retirement_index <= result["years"]:
+        probability = float((
+            (result["paths"][:, retirement_index] >= result["fi_target"][retirement_index])
+            & (result["shortfall"][:, retirement_index] <= 1e-8)
+        ).mean())
+    result["home_equity_path"] = result["property_equity"]
+    result["probability_of_fi_by_retirement"] = probability
+    result["portfolio_paths"] = result["paths"]
+    result["portfolio_median"] = result["median"]
+    result["paths"] = result["net_worth"]
+    result["median"] = result["median_net_worth"]
+    return result
 
-    return {
-        "paths": paths,
-        "median": median,
-        "p10": np.percentile(paths, 10, axis=0),
-        "p25": np.percentile(paths, 25, axis=0),
-        "p75": np.percentile(paths, 75, axis=0),
-        "p90": np.percentile(paths, 90, axis=0),
-        "home_equity_path": np.maximum(home_equity_path, 0),
-        "fi_year": fi_year,
-        "fi_age": p.age + fi_year if fi_year is not None else None,
-        "probability_of_fi_by_retirement": float(
-            (paths[:, min(years, max(1, p.retirement_age - p.age))] >= p.fi_number).mean()
-        ),
-        "real_terms": True,
-    }
+
+def _home_project_recommendations(p: Profile, expected_return: float) -> list[Recommendation]:
+    """Capital projects on a home you already own, judged as investments.
+
+    A roof full of panels is not a lifestyle choice, it is an after-tax,
+    inflation-linked return that competes directly with the index fund the
+    same money would otherwise buy — so it belongs on the same list. Both are
+    only suggested where the arithmetic actually works for this owner's state:
+    solar is a good buy in California and a poor one in Washington purely
+    because of what the utility charges, and lawn removal only pays where
+    water is expensive and districts fund it.
+    """
+    from . import lookup
+    from .projects import (SolarInputs, TurfInputs, solar_analysis,
+                           turf_analysis)
+
+    if p.home_value <= 0:
+        return []
+
+    state = (p.state or "").upper()
+    out: list[Recommendation] = []
+
+    rate = lookup.STATE_ELECTRICITY_RATE.get(state)
+    production = lookup.STATE_SOLAR_PRODUCTION.get(state)
+    if rate and production:
+        try:
+            solar = solar_analysis(SolarInputs(
+                installation_year=date.today().year,
+                current_rate_per_kwh=rate,
+                annual_production_kwh_per_kw=production,
+                home_value=p.home_value,
+                discount_rate=expected_return,
+                # NEM 3.0 pays roughly a quarter of retail for exports in
+                # California; elsewhere full retail is still the norm.
+                net_metering_credit_rate=0.25 if state == "CA" else 1.0,
+            ))
+        except Exception:
+            solar = None
+        if solar and solar.get("irr") and solar["irr"] > expected_return and solar.get("payback_year"):
+            out.append(Recommendation(
+                title=f"Solar would return {solar['irr']:.1%}/yr on your roof",
+                priority=Priority.MEDIUM,
+                category="Home projects",
+                rationale=(
+                    f"At {state}'s ~${rate:.2f}/kWh and {production:,.0f} kWh per kW of panel a year, a "
+                    f"typical system pays for itself in year {solar['payback_year']} and returns "
+                    f"{solar['irr']:.1%} — against the {expected_return:.1%} you expect from the market. "
+                    "The return is effectively tax-free, because it arrives as a bill you stop paying "
+                    "rather than as income."
+                ),
+                action=("Get two or three quotes and run them through the Home Projects page — cost per "
+                        "watt varies between installers. No federal residential clean-energy credit "
+                        "is assumed for installations after December 31, 2025."),
+                annual_impact=solar.get("year_1_savings", 0.0),
+                lifetime_impact=solar.get("npv", 0.0),
+                confidence="low",
+                tags=["home", "projects"],
+            ))
+
+    if state in lookup.WATER_STRESSED_STATES:
+        try:
+            turf = turf_analysis(TurfInputs(discount_rate=expected_return))
+        except Exception:
+            turf = None
+        if turf and turf.get("irr") and turf["irr"] > expected_return:
+            out.append(Recommendation(
+                title=f"Replacing the lawn returns {turf['irr']:.1%}/yr where water is scarce",
+                priority=Priority.LOW,
+                category="Home projects",
+                rationale=(
+                    f"In {state}, water districts commonly pay a rebate per square foot to remove turf, "
+                    f"and the water and maintenance you stop buying compound at {turf.get('irr', 0):.1%} "
+                    f"— payback lands around year {turf.get('payback_year', '—')}. Budget for a second "
+                    "install: artificial turf lasts about 18 years, and that replacement is what erodes "
+                    "the long-run return."
+                ),
+                action=("Check your water district's rebate before committing — they are the difference "
+                        "between a good and a mediocre return — then model your own lawn size on the "
+                        "Home Projects page."),
+                annual_impact=turf.get("annual_savings_year_1", 0.0),
+                lifetime_impact=turf.get("npv", 0.0),
+                confidence="low",
+                tags=["home", "projects"],
+            ))
+
+    return out

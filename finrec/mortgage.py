@@ -23,7 +23,7 @@ import pandas as pd
 
 from .core import monthly_payment
 
-__all__ = ["Mortgage", "amortization_schedule", "refinance_analysis"]
+__all__ = ["Mortgage", "amortization_schedule", "refinance_analysis", "prepay_vs_invest"]
 
 
 @dataclass
@@ -201,6 +201,84 @@ def amortization_schedule(
     return pd.DataFrame(rows)
 
 
+def prepay_vs_invest(
+    principal: float,
+    annual_rate: float,
+    term_years: int,
+    extra_monthly_payment: float,
+    investment_return: float = 0.07,
+    investment_gains_tax_rate: float = 0.15,
+    horizon_years: int | None = None,
+    home_value: float | None = None,
+) -> dict:
+    """Compare equal monthly budgets, including debt and taxable investments.
+
+    Both strategies spend scheduled P&I plus ``extra_monthly_payment`` each
+    month. Any unused mortgage budget (including the partial final payment)
+    is invested at month end. Gains are taxed on hypothetical liquidation at
+    each row's date. ``difference`` is prepay minus invest after-tax net wealth;
+    common home value cancels. No mortgage-interest deduction is assumed.
+    """
+    horizon = term_years if horizon_years is None else horizon_years
+    if principal < 0 or extra_monthly_payment < 0 or horizon <= 0:
+        raise ValueError("principal/extra payment must be nonnegative and horizon positive")
+    if investment_return <= -1 or not 0 <= investment_gains_tax_rate <= 1:
+        raise ValueError("invalid investment return or gains tax rate")
+    base = Mortgage(principal, annual_rate, term_years)
+    accelerated = Mortgage(principal, annual_rate, term_years,
+                           extra_monthly_payment=extra_monthly_payment)
+    schedules = [accelerated.schedule(), base.schedule()]
+    budget = base.monthly_payment + extra_monthly_payment
+    monthly_return = (1 + investment_return) ** (1 / 12) - 1
+    portfolios = [0.0, 0.0]
+    bases = [0.0, 0.0]
+    value = principal if home_value is None else home_value
+    rows = []
+    for month in range(horizon * 12 + 1):
+        row = {"month": month, "year": month / 12, "monthly_budget": budget}
+        for idx, label in enumerate(("prepay", "invest")):
+            schedule = schedules[idx]
+            payment = 0.0
+            debt = principal if month == 0 else 0.0
+            if month and month <= len(schedule):
+                entry = schedule.iloc[month - 1]
+                payment, debt = float(entry["payment"]), float(entry["balance"])
+            if month:
+                contribution = max(0.0, budget - payment)
+                portfolios[idx] = portfolios[idx] * (1 + monthly_return) + contribution
+                bases[idx] += contribution
+            gains_tax = max(0.0, portfolios[idx] - bases[idx]) * investment_gains_tax_rate
+            row.update({
+                f"{label}_payment": payment, f"{label}_debt": debt,
+                f"{label}_portfolio": portfolios[idx], f"{label}_basis": bases[idx],
+                f"{label}_gains_tax": gains_tax,
+                f"{label}_net_wealth": value - debt + portfolios[idx] - gains_tax,
+            })
+        row["difference"] = row["prepay_net_wealth"] - row["invest_net_wealth"]
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    final = rows[-1]
+    months = horizon * 12
+    return {
+        "table": table, "horizon_months": months, "monthly_budget": budget,
+        "home_value_assumption": value,
+        "prepay_net_wealth": final["prepay_net_wealth"],
+        "invest_net_wealth": final["invest_net_wealth"], "difference": final["difference"],
+        "interest_saved": float(schedules[1].head(months)["interest"].sum()
+                                - schedules[0].head(months)["interest"].sum()),
+        "months_saved": len(schedules[1]) - len(schedules[0]),
+        "winner": "prepay" if final["difference"] > 1e-6 else (
+            "invest" if final["difference"] < -1e-6 else "tie"),
+        "assumptions": [
+            "Equal monthly P&I plus extra-payment budgets; unused payments reinvested.",
+            "Month-end contributions; constant common home value; terminal debt deducted.",
+            "If home value is omitted, initial principal is used; this common amount cancels in the difference.",
+            "Gains taxed only on liquidation at the caller's rate; no tax credit for losses.",
+            "No mortgage-interest deduction, PMI, investment dividend tax drag, or transaction fees.",
+        ],
+    }
+
+
 def refinance_analysis(
     current_principal: float,
     current_rate: float,
@@ -212,6 +290,7 @@ def refinance_analysis(
     roll_costs_into_loan: bool = True,
     cash_out: float = 0.0,
     invest_savings_return: float = 0.07,
+    discount_rate: float = 0.0,
 ) -> dict:
     """Compare keeping the current loan against refinancing.
 
@@ -219,11 +298,15 @@ def refinance_analysis(
     is the *remaining principal*, obtained from the amortization schedule —
     interest already paid is a sunk cost and is not subtracted from principal.
 
-    The comparison is over the *remaining* life of the current loan, and also
-    reports what the monthly savings become if invested rather than spent,
-    since a longer new term can lower the payment while raising lifetime cost.
+    Costs are present values of payments plus terminal debt over the remaining
+    original term, less cash-out received at inception. ``break_even_month``
+    now means economic break-even including debt; ``payment_break_even_month``
+    retains the old closing-cost/payment-relief calculation. Discounting is an
+    explicit annual effective rate (zero by default), not an assumed stock return.
     """
     current = Mortgage(current_principal, current_rate, current_term_years)
+    if months_already_paid < 0 or closing_costs < 0 or cash_out < 0 or discount_rate <= -1:
+        raise ValueError("invalid refinance cashflows, elapsed months, or discount rate")
     current_schedule = current.schedule()
 
     remaining_balance = float(
@@ -245,28 +328,42 @@ def refinance_analysis(
     upfront_cost = 0.0 if roll_costs_into_loan else closing_costs
     monthly_savings = current.monthly_payment - new_loan.monthly_payment
 
-    break_even_month = None
+    payment_break_even_month = None
     if monthly_savings > 0 and closing_costs > 0:
-        break_even_month = int(np.ceil(closing_costs / monthly_savings))
+        payment_break_even_month = int(np.ceil(closing_costs / monthly_savings))
     elif monthly_savings > 0:
-        break_even_month = 0
+        payment_break_even_month = 0
 
-    # Apples-to-apples: cost over the shorter of the two remaining horizons.
-    horizon = min(months_remaining, len(new_schedule)) or months_remaining
-    keep_cost = float(
-        current_schedule.loc[
-            (current_schedule["month"] > months_already_paid)
-            & (current_schedule["month"] <= months_already_paid + horizon),
-            "total_payment",
-        ].sum()
-    )
-    refi_cost = float(new_schedule.loc[new_schedule["month"] <= horizon, "total_payment"].sum()) + upfront_cost
-
-    invested_savings = 0.0
-    if monthly_savings > 0:
-        r = (1 + invest_savings_return) ** (1 / 12) - 1
-        n = horizon
-        invested_savings = monthly_savings * (((1 + r) ** n - 1) / r) if r else monthly_savings * n
+    horizon = months_remaining
+    keep_payments = current_schedule.iloc[months_already_paid:].reset_index(drop=True)
+    keep_pv = 0.0
+    refi_pv = upfront_cost - cash_out
+    break_even_month = None
+    invested_savings = cash_out - upfront_cost
+    r = (1 + invest_savings_return) ** (1 / 12) - 1
+    rows = []
+    keep_cost, refi_cost = remaining_balance, new_balance + refi_pv
+    keep_terminal, refi_terminal = remaining_balance, new_balance
+    for month in range(1, horizon + 1):
+        keep = keep_payments.iloc[month - 1]
+        refi = new_schedule.iloc[month - 1] if month <= len(new_schedule) else None
+        kp = float(keep["total_payment"])
+        rp = float(refi["total_payment"]) if refi is not None else 0.0
+        keep_terminal = float(keep["balance"])
+        refi_terminal = float(refi["balance"]) if refi is not None else 0.0
+        discount = (1 + discount_rate) ** (month / 12)
+        keep_pv += kp / discount
+        refi_pv += rp / discount
+        keep_cost = keep_pv + keep_terminal / discount
+        refi_cost = refi_pv + refi_terminal / discount
+        benefit = keep_cost - refi_cost
+        invested_savings = invested_savings * (1 + r) + kp - rp
+        if break_even_month is None and benefit > 1e-6:
+            break_even_month = month
+        rows.append({"month": month, "year": month / 12,
+                     "keep_debt": keep_terminal, "refi_debt": refi_terminal,
+                     "keep_cost": keep_cost, "refi_cost": refi_cost,
+                     "economic_benefit": benefit})
 
     return {
         "remaining_balance": remaining_balance,
@@ -274,6 +371,8 @@ def refinance_analysis(
         "current_payment": current.monthly_payment,
         "new_payment": new_loan.monthly_payment,
         "monthly_savings": monthly_savings,
+        "payment_relief": monthly_savings,
+        "payment_break_even_month": payment_break_even_month,
         "closing_costs": closing_costs,
         "break_even_month": break_even_month,
         "break_even_years": break_even_month / 12.0 if break_even_month else None,
@@ -284,6 +383,13 @@ def refinance_analysis(
         "cost_over_horizon_refi": refi_cost,
         "net_benefit_over_horizon": keep_cost - refi_cost,
         "savings_if_invested": invested_savings,
-        "worth_it": (keep_cost - refi_cost) > 0,
+        "invested_savings_net_of_terminal_debt": invested_savings + keep_terminal - refi_terminal,
+        "worth_it": (keep_cost - refi_cost) > 1e-6,
         "new_loan_amount": new_balance,
+        "horizon_months": horizon, "discount_rate": discount_rate,
+        "terminal_balance_keep": keep_terminal, "terminal_balance_refi": refi_terminal,
+        "table": pd.DataFrame(rows),
+        "assumptions": ["Equal original remaining horizon; terminal debt is repaid at horizon.",
+                        "Costs include closing fees once and offset cash-out proceeds at inception.",
+                        "Payment relief is not economic savings; no mortgage-interest tax deduction."],
     }

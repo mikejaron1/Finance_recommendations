@@ -14,6 +14,15 @@ data/*.csv
 data/*.xlsx
 data/*.json
 !data/sample_*.csv
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.finrec/
+backups/
+finrec-export-*.json
+financial_profile.json
 
 # Python
 __pycache__/
@@ -28,6 +37,7 @@ venv/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.venv-review/
 htmlcov/
 
 # Notebooks (project is now a proper app)

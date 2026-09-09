@@ -4,6 +4,7 @@ import dataclasses
 
 import pytest
 
+from finrec import taxes as tax_mod
 from finrec.retirement import (
     RetirementInputs,
     contribution_priority,
@@ -190,3 +191,106 @@ class TestDrawdownPlan:
         r = drawdown_plan(i, 1_800_000, 400_000, 0, n_sims=600)
         assert 0.0 <= r["success_rate"] <= 1.0
         assert 0.0 <= r["success_rate_with_guardrails"] <= 1.0
+
+
+class TestTheRateItComparesAgainst:
+    """The whole decision turns on today's marginal rate, so it has to be real."""
+
+    def test_state_tax_is_counted_once(self):
+        """California's rate was added twice, putting a $115k household on
+        38.6% when the honest combined figure is 21.3% -- enough on its own to
+        flip the recommendation."""
+        r = rvt(gross_income=115_000, filing_status="married_joint", state="CA")
+        fed_and_state = tax_mod.compute_tax(
+            115_000, "married_joint", 2025, state="CA", include_payroll=False
+        ).marginal_rate
+        assert r["current_marginal_rate"] == pytest.approx(fed_and_state)
+        assert r["current_marginal_rate"] < 0.30
+
+    def test_it_uses_the_state_rate_for_that_income_not_the_top_rate(self):
+        """A modest income does not pay California's 13.3% top bracket."""
+        r = rvt(gross_income=115_000, filing_status="married_joint", state="CA")
+        assert r["current_marginal_rate"] < 0.12 + 0.133
+
+    def test_the_retirement_rate_is_counted_once_too(self):
+        r = rvt(state="CA", retirement_state="CA", desired_retirement_spending=120_000,
+                filing_status="married_joint")
+        expected = tax_mod.compute_tax(120_000, "married_joint", 2025, state="CA",
+                                       include_payroll=False).marginal_rate
+        assert r["projected_retirement_marginal_rate"] == pytest.approx(expected)
+
+    def test_a_business_loss_lowers_the_rate_it_compares_at(self):
+        normal = rvt(gross_income=295_000, filing_status="married_joint", state="CA",
+                     w2_wages=295_000)
+        loss_year = rvt(gross_income=115_000, filing_status="married_joint", state="CA",
+                        self_employment_income=-180_000, w2_wages=295_000)
+        assert loss_year["current_taxable_income"] < normal["current_taxable_income"] - 150_000
+        assert loss_year["current_marginal_rate"] < normal["current_marginal_rate"] - 0.05
+
+    def test_a_loss_year_makes_roth_more_attractive(self):
+        """Giving up a deduction is cheap when the deduction is worth little."""
+        normal = rvt(gross_income=295_000, filing_status="married_joint", state="CA",
+                     w2_wages=295_000)
+        loss_year = rvt(gross_income=115_000, filing_status="married_joint", state="CA",
+                        self_employment_income=-180_000, w2_wages=295_000)
+        gap = lambda r: r["roth_spendable"] - r["traditional_spendable"]  # noqa: E731
+        assert gap(loss_year) > gap(normal)
+
+    def test_self_employment_income_is_taxed_as_self_employment(self):
+        """Half the SE tax is deductible, so the same headline income taxed as
+        business profit leaves less taxable income than a salary does."""
+        salaried = rvt(gross_income=200_000, filing_status="single")
+        owner = rvt(gross_income=200_000, filing_status="single",
+                    self_employment_income=200_000, w2_wages=0.0)
+        assert owner["current_taxable_income"] < salaried["current_taxable_income"]
+
+    def test_deductions_you_type_in_reach_the_calculation(self):
+        plain = rvt(gross_income=295_000, filing_status="married_joint")
+        itemised = rvt(gross_income=295_000, filing_status="married_joint",
+                       itemized_deductions=90_000)
+        above = rvt(gross_income=295_000, filing_status="married_joint",
+                    above_the_line_deductions=60_000)
+        assert itemised["current_taxable_income"] < plain["current_taxable_income"]
+        assert above["current_taxable_income"] < plain["current_taxable_income"]
+
+
+class TestWhereTheRothPotComesFrom:
+    """The page has to be able to say why a 'Roth' pot pays any tax."""
+
+    def test_the_balance_you_already_hold_is_not_called_an_employer_match(self):
+        r = rvt(existing_traditional_balance=250_000, annual_contribution=23_500,
+                employer_match_pct=0.05, employer_match_limit_pct=0.06,
+                gross_income=295_000, match_eligible_pay=215_000)
+        timeline = r["timeline"]
+        assert "existing_pretax" in timeline.columns
+        assert "employer_match" in timeline.columns
+        end_match = float(timeline["employer_match"].iloc[-1])
+        end_existing = float(timeline["existing_pretax"].iloc[-1])
+        assert end_existing > end_match          # $250k compounding beats $10.75k/yr
+
+        # The decisive check: what the employer puts in cannot depend on what
+        # you already have. The old code added the existing balance into the
+        # match and captioned the total "employer contributions", which read as
+        # though an employer capped at $11k a year had supplied two thirds of
+        # the pot.
+        no_balance = rvt(existing_traditional_balance=0, annual_contribution=23_500,
+                         employer_match_pct=0.05, employer_match_limit_pct=0.06,
+                         gross_income=295_000, match_eligible_pay=215_000)
+        assert float(no_balance["timeline"]["employer_match"].iloc[-1]) == pytest.approx(end_match)
+        assert float(no_balance["timeline"]["existing_pretax"].iloc[-1]) == pytest.approx(0)
+
+    def test_the_match_respects_a_plan_dollar_cap(self):
+        r = rvt(employer_match_pct=0.05, employer_match_limit_pct=0.06,
+                match_eligible_pay=300_000, employer_match_dollar_cap=11_000,
+                annual_contribution=23_500)
+        assert r["employer_match_annual"] == pytest.approx(11_000)
+        assert "dollar cap" in r["employer_match_detail"]["binding"]
+
+    def test_the_match_is_on_your_pay_not_the_households(self):
+        """A partner's employer matches into a partner's plan."""
+        household = rvt(gross_income=400_000, match_eligible_pay=None,
+                        employer_match_pct=0.05, employer_match_limit_pct=0.05)
+        mine_only = rvt(gross_income=400_000, match_eligible_pay=215_000,
+                        employer_match_pct=0.05, employer_match_limit_pct=0.05)
+        assert mine_only["employer_match_annual"] < household["employer_match_annual"]
+        assert mine_only["employer_match_annual"] == pytest.approx(215_000 * 0.05)

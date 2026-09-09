@@ -15,7 +15,8 @@ returns to preserve autocorrelation).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Literal
 
 import numpy as np
@@ -25,11 +26,18 @@ __all__ = [
     "MarketAssumptions",
     "simulate_returns",
     "simulate_wealth",
+    "simulate_wealth_schedule",
     "simulate_drawdown",
     "percentile_bands",
+    "BORROW_RATE",
 ]
 
 ReturnModel = Literal["lognormal", "student_t", "bootstrap"]
+
+# What unfunded spending costs you. Roughly a real HELOC or margin rate: if a
+# plan overspends, the gap has to come from somewhere, and pretending it is
+# free is what lets a bankrupt plan look rich.
+BORROW_RATE = 0.045
 
 # Long-run real-ish nominal assumptions (arithmetic mean, annual std dev).
 # Sources: broad historical US/global series. Deliberately conservative versus
@@ -90,14 +98,14 @@ def simulate_returns(
     sigma_p = a.volatility / np.sqrt(periods_per_year)
 
     if a.model == "bootstrap":
-        picks = rng.integers(0, len(HISTORICAL_ANNUAL_RETURNS), size=(n_sims, n_periods))
+        picks = rng.integers(0, len(HISTORICAL_ANNUAL_RETURNS), size=(n_periods, n_sims)).T
         annual = HISTORICAL_ANNUAL_RETURNS[picks]
         if periods_per_year == 1:
             return annual
         return (1 + annual) ** (1 / periods_per_year) - 1
 
     if a.model == "student_t":
-        raw = rng.standard_t(a.student_t_df, size=(n_sims, n_periods))
+        raw = rng.standard_t(a.student_t_df, size=(n_periods, n_sims)).T
         # Rescale so the sample std matches the target volatility.
         raw = raw / np.sqrt(a.student_t_df / (a.student_t_df - 2))
         return mu_p + sigma_p * raw
@@ -105,7 +113,17 @@ def simulate_returns(
     # Lognormal: guarantees returns can never fall below -100%.
     variance = np.log(1 + (sigma_p / (1 + mu_p)) ** 2)
     mu_log = np.log(1 + mu_p) - variance / 2
-    return np.exp(rng.normal(mu_log, np.sqrt(variance), size=(n_sims, n_periods))) - 1
+    return np.exp(rng.normal(mu_log, np.sqrt(variance), size=(n_periods, n_sims)).T) - 1
+
+
+@lru_cache(maxsize=16)
+def scenario_returns(years: int, n_sims: int, mean: float, volatility: float,
+                     inflation: float) -> np.ndarray:
+    """Read-only common real returns, reused by comparisons and root searches."""
+    draws = simulate_returns(years, n_sims, MarketAssumptions(
+        mean_return=(1 + mean) / (1 + inflation) - 1, volatility=volatility))
+    draws.setflags(write=False)
+    return draws
 
 
 def simulate_inflation(years: int, n_sims: int, assumptions: MarketAssumptions | None = None) -> np.ndarray:
@@ -149,6 +167,82 @@ def simulate_wealth(
             paths[:, t + 1] = balance / cum_inflation
         else:
             paths[:, t + 1] = balance
+    return paths
+
+
+def simulate_wealth_schedule(
+    initial: float,
+    contributions: "np.ndarray | list[float]",
+    assumptions: MarketAssumptions | None = None,
+    n_sims: int = 2_000,
+    annual_fee: float = 0.0,
+    borrow_rate: float = BORROW_RATE,
+    return_shortfall: bool = False,
+) -> "np.ndarray | tuple[np.ndarray, np.ndarray]":
+    """Accumulation with a **per-year** contribution schedule, in real terms.
+
+    ``simulate_wealth`` takes one contribution figure and grows it at a
+    constant rate, which can only express "I save the same share of a steadily
+    rising income, forever". Real life is lumpy: a down payment leaves in one
+    year, childcare arrives for a decade and then stops, a mortgage payment
+    ends on a known date. Those need a contribution *vector*.
+
+    ``contributions[t]`` is the amount added at the end of year ``t``, in
+    today's dollars, and **may be negative** — that is the whole point. A year
+    where the down payment lands, or where the new mortgage costs more than
+    the income supports, is a year the portfolio shrinks. Silently flooring it
+    at zero (as ``max(0, savings)`` does elsewhere) would hide precisely the
+    risk the user is asking about.
+
+    Returns are drawn in **real** terms directly, by deflating the mean return
+    by expected inflation, rather than by simulating stochastic inflation and
+    dividing. Scenarios carry fixed-rate mortgages whose real burden falls at a
+    known rate, and mixing a stochastic deflator into the portfolio while the
+    debt used a deterministic one would make the two sides inconsistent. One
+    deterministic price level for everything is easier to defend and to
+    explain.
+    """
+    a = assumptions or MarketAssumptions()
+    contributions = np.asarray(contributions, dtype=float)
+    years = len(contributions)
+    if years == 0:
+        return np.full((n_sims, 1), float(initial))
+
+    real_mean = (1 + a.mean_return) / (1 + a.inflation_mean) - 1
+    real_assumptions = replace(a, mean_return=real_mean)
+    returns = simulate_returns(years, n_sims, real_assumptions)
+
+    paths = np.empty((n_sims, years + 1), dtype=float)
+    shortfall = np.zeros((n_sims, years + 1), dtype=float)
+    paths[:, 0] = float(initial)
+    balance = np.full(n_sims, float(initial))
+    owed = np.zeros(n_sims)
+
+    for t in range(years):
+        balance = balance * (1 + returns[:, t])
+        balance *= 1 - annual_fee
+        balance = balance + contributions[t]
+        # A portfolio cannot go negative at equity returns — but the spending
+        # that emptied it does not stop, and simply clamping at zero would make
+        # it vanish. That turns running out of money into a free lunch: a plan
+        # that bankrupts you scores *better* than one that doesn't, because its
+        # losses are quietly discarded. The unfunded amount is carried instead
+        # as borrowing, compounding at ``borrow_rate``, so it stays visible and
+        # keeps the comparison between scenarios honest.
+        owed *= 1 + borrow_rate
+        # A recovered year pays the borrowing back before it rebuilds savings.
+        # Nobody services an expensive loan while investing alongside it, and
+        # leaving the debt outstanding forever would permanently disqualify a
+        # plan that had one bad stretch and then recovered.
+        repaid = np.minimum(owed, np.maximum(balance, 0.0))
+        owed -= repaid
+        balance -= repaid
+        owed += np.maximum(0.0, -balance)
+        balance = np.maximum(balance, 0.0)
+        paths[:, t + 1] = balance
+        shortfall[:, t + 1] = owed
+    if return_shortfall:
+        return paths, shortfall
     return paths
 
 
